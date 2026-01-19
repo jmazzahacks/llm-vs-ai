@@ -1,0 +1,15 @@
+[project]
+name = "vsai-mcp-server"
+version = "0.1.0"
+description = "MCP Server for Vintage Story AI Bot Control"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+vsai-mcp = "vsai_server:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

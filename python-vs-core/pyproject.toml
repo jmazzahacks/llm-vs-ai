@@ -1,0 +1,28 @@
+[project]
+name = "vintage-story-core"
+version = "0.0.1"
+authors = [
+  { name="Jason Byteforge", email="jmazzahacks@gmail.com" },
+]
+description = "Core utilities for Vintage Story AI bot control"
+keywords = ["vintage-story", "game", "ai", "bot", "voxel", "pathfinding", "visibility"]
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT License"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vintage_story_core"]
+
+[project.urls]
+Homepage = "https://github.com/jmazzahacks/vintage-story-core"
+Issues = "https://github.com/jmazzahacks/vintage-story-core/issues"

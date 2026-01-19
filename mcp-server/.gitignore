@@ -1,0 +1,29 @@
+# Subprojects (each has its own git repo)
+arcana-core/
+docker-arcana-mcp-server/
+docker-arcana-server/
+python-arcana-client/
+
+# Virtual environment
+bin/
+lib/
+share/
+pyvenv.cfg
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# IDE/Editor
+.vscode/
+.idea/
+
+# Cache
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime
+logs/
+generated/

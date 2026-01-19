@@ -1,0 +1,15 @@
+{
+    "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
+    "type": "Code",
+    "modid": "vsai",
+    "name": "Vintage Story AI Bridge",
+    "authors": [
+        "jmazzahacks"
+    ],
+    "description": "HTTP API bridge for external AI control of player actions",
+    "version": "0.2.0",
+    "dependencies": {
+        "game": "1.21.0",
+        "survival": ""
+    }
+}

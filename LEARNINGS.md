@@ -1,0 +1,1035 @@
+# Vintage Story AI Bot - Development Learnings
+
+This document captures key learnings and discoveries made while developing an AI-controlled bot for Vintage Story.
+
+## Architecture Overview
+
+```
+Python/LLM Layer (future)
+        |
+        | HTTP (localhost:4560)
+        v
+   C# Server Mod
+        |
+        v
+  Bot Entity in VS World
+```
+
+## SOLUTION: Custom Entity with Custom AI Task
+
+**The winning approach:** Create a custom entity type (`vsai:aibot`) that has:
+- TaskAI behavior with our custom `AiTaskRemoteControl` task
+- Uses `PathTraverser.NavigateTo()` for A* pathfinding
+- Uses trader shape/texture for humanoid appearance
+- `stepHeight: 1.01` to handle full-block terrain
+
+**Why this works:** We get native VS movement with pathfinding, controlled via HTTP API.
+
+### Custom Entity File Structure
+
+```
+mod/assets/vsai/
+├── entities/
+│   └── aibot.json          # Entity definition
+├── shapes/
+│   └── entity/humanoid/
+│       └── trader.json     # COPIED from survival mod (required!)
+└── textures/
+    └── entity/humanoid/
+        └── trader.png      # COPIED from survival mod
+```
+
+**CRITICAL:** Shape files must be COPIED into your mod's assets folder. Cross-mod references like `survival:entity/humanoid/trader` do NOT work reliably - VS looks in your mod first, fails, and makes entity invisible.
+
+### Entity JSON Key Points
+
+```json
+{
+    "code": "aibot",
+    "class": "EntityAgent",
+    "client": {
+        "shape": { "base": "entity/humanoid/trader" },  // NO mod prefix!
+        "texture": { "base": "entity/humanoid/trader" },
+        "behaviors": [
+            { "code": "controlledphysics", "stepHeight": 1.01 }  // MUST be >1.0 for full blocks!
+        ],
+        "animations": [
+            // Use ACTUAL animation names from shape file:
+            { "code": "idle", "animation": "balanced-idle", ... },
+            { "code": "walk", "animation": "balanced-walk", ... },
+            { "code": "run", "animation": "balanced-run", ... }
+        ]
+    },
+    "server": {
+        "attributes": {
+            "pathfinder": {
+                "minTurnAnglePerSec": 360,
+                "maxTurnAnglePerSec": 720
+            }
+        },
+        "behaviors": [
+            { "code": "controlledphysics", "stepHeight": 1.01 },  // CRITICAL: both client AND server!
+            { "code": "health", "currenthealth": 20, "maxhealth": 20 },
+            { "code": "floatupwhenstuck", "onlyWhenDead": false },
+            {
+                "code": "taskai",
+                "aiCreatureType": "LandCreature",
+                "aitasks": [
+                    {
+                        "code": "vsai:remotecontrol",  // Our custom AI task
+                        "priority": 999,
+                        "movespeed": 0.03
+                    }
+                ]
+            }
+        ]
+    }
+}
+```
+
+### stepHeight - CRITICAL for Terrain Navigation
+
+The `stepHeight` parameter in `controlledphysics` determines how tall an obstacle the entity can "step up" onto without jumping.
+
+- **stepHeight: 0.6** (default) - Can only step up slabs, stairs, partial blocks
+- **stepHeight: 1.01** - Can step up FULL blocks (standard terrain)
+- **stepHeight: 1.5+** - Can step up 1.5 block obstacles
+
+**MUST set on BOTH client AND server behaviors!**
+
+**Two systems at play:**
+1. **A* Pathfinder** - calculates a theoretical path (has its own stepHeight parameter)
+2. **Physics Engine** - actually moves the entity (uses entity's controlledphysics stepHeight)
+
+If pathfinder finds a path but physics can't execute it (stepHeight too low), the bot gets stuck.
+
+**The physics engine does NOT automatically jump.** It only "glides up" obstacles within stepHeight. For full-block terrain, use stepHeight >= 1.01.
+
+## Movement Approaches
+
+### Approach 6: Custom AI Task with PathTraverser.NavigateTo - BEST SOLUTION!
+
+**The winning approach:** Create a custom AI task that uses VS's native `PathTraverser.NavigateTo()` for A* pathfinding and physics-based movement.
+
+```csharp
+public class AiTaskRemoteControl : AiTaskBase
+{
+    private Vec3d? _pendingTarget;
+    private float _moveSpeed = 0.03f;
+    private string _status = "idle";  // idle, pending, moving, reached, stuck
+
+    public AiTaskRemoteControl(EntityAgent entity, JsonObject taskConfig, JsonObject aiConfig)
+        : base(entity, taskConfig, aiConfig) { }
+
+    public override bool ShouldExecute() => true;  // Always active
+
+    public override bool ContinueExecute(float dt)
+    {
+        if (_pendingTarget != null && _status != "moving")
+        {
+            _status = "moving";
+            // NavigateTo uses A* pathfinding internally!
+            pathTraverser.NavigateTo(_pendingTarget, _moveSpeed, 0.5f, OnGoalReached, OnStuck);
+            _pendingTarget = null;
+        }
+        return true;
+    }
+
+    private void OnGoalReached() => _status = "reached";
+    private void OnStuck() => _status = "stuck";
+
+    public void SetTarget(Vec3d target, float speed) {
+        _pendingTarget = target.Clone();
+        _moveSpeed = speed;
+        _status = "pending";
+    }
+}
+```
+
+**Registration in ModSystem.Start():**
+```csharp
+AiTaskRegistry.Register<AiTaskRemoteControl>("vsai:remotecontrol");
+```
+
+**Entity JSON configuration:**
+```json
+{
+    "code": "taskai",
+    "aiCreatureType": "LandCreature",
+    "aitasks": [
+        {
+            "code": "vsai:remotecontrol",
+            "priority": 999,
+            "movespeed": 0.03
+        }
+    ]
+}
+```
+
+**Why this works:**
+- `NavigateTo()` runs A* pathfinding to find a valid path
+- PathTraverser handles following waypoints
+- Physics engine (`controlledphysics`) handles actual movement each tick
+- Bot can navigate around obstacles, climb hills, handle terrain changes
+- Native VS movement = proper animations, physics, collision
+
+**WalkTowards vs NavigateTo:**
+- `WalkTowards(target, ...)` - walks in a STRAIGHT LINE toward target, no pathfinding
+- `NavigateTo(target, ...)` - runs A* pathfinding, follows waypoints around obstacles
+
+### Approach 1: Setting Controls (EntityControls) - DOESN'T WORK
+```csharp
+agent.Controls.Forward = true;
+agent.Controls.Sprint = true;
+```
+- **Result:** Does NOT move non-player entities
+- **Reason:** Server-side control changes don't drive physics movement
+
+### Approach 2: Setting Motion/Velocity - DOESN'T WORK
+```csharp
+agent.ServerPos.Motion.Set(motionX, motionY, motionZ);
+```
+- **Result:** Motion gets reset by physics each tick
+- **Reason:** Physics behavior overrides motion values
+
+### Approach 3: Teleportation - WORKS (but ugly)
+```csharp
+entity.TeleportTo(new Vec3d(x, y, z));
+```
+- **Result:** Works reliably, instant position change
+- **Limitation:** Not smooth movement
+
+### Approach 4: PathTraverser - DOESN'T WORK ALONE
+```csharp
+var taskAiBehavior = entity.GetBehavior("taskai");
+var pathTraverser = /* get via reflection */;
+pathTraverser.WalkTowards(targetPos, speed, ...);
+```
+- **Result:** Rotates entity to face target but does NOT move it
+- **Reason:** Movement happens in AI task processing loop - empty aitasks = no movement
+- **Note:** Works on creatures with active AI tasks, but then AI interferes
+
+### Approach 5: Tick-Based Direct Position Updates - DEPRECATED
+We previously used manual tick handlers to update position directly. This worked but was replaced by Approach 6 (Custom AI Task) which uses VS's native movement system.
+
+### Why Approaches 1-4 Failed
+
+**Setting Controls alone:** `agent.Controls.Forward = true` does NOT move non-player entities. Movement requires active AI tasks.
+
+**Setting Motion:** `ServerPos.Motion.X/Z` gets reduced by physics friction each tick.
+
+**PathTraverser alone:** Without an AI task calling it each tick, PathTraverser doesn't execute movement.
+
+## SOLUTION: Animation Triggering - WORKING!
+
+**Problem:** Bot moves but doesn't play walking animation.
+
+**What DOESN'T work:**
+- `AnimManager.StartAnimation("walk")` - server-side call doesn't sync to client
+- `AnimManager.StartAnimation(new AnimationMetaData { ClientSide = false })` - still doesn't sync
+
+**What WORKS:** Use `triggeredBy` with `onControls` in the entity JSON!
+
+The VS animation system uses `EnumEntityActivity` flags to determine which animations play. When you set `agent.Controls.Forward = true`, it makes `Controls.TriesToMove` return `true`, which sets the `Move` activity flag. Animations with matching `triggeredBy.onControls` will automatically play.
+
+### Entity JSON Animation Configuration
+```json
+{
+    "animations": [
+        {
+            "code": "idle",
+            "animation": "balanced-idle",
+            "weight": 1,
+            "animationSpeed": 1,
+            "triggeredBy": { "defaultAnim": true }
+        },
+        {
+            "code": "walk",
+            "animation": "balanced-walk",
+            "weight": 10,
+            "animationSpeed": 1.5,
+            "triggeredBy": {
+                "onControls": ["move"],
+                "matchExact": false
+            }
+        },
+        {
+            "code": "run",
+            "animation": "balanced-run",
+            "weight": 10,
+            "animationSpeed": 1.5,
+            "triggeredBy": {
+                "onControls": ["move", "sprintmode"],
+                "matchExact": true
+            }
+        }
+    ]
+}
+```
+
+### Valid `onControls` Values (from EnumEntityActivity)
+- `idle`, `move`, `sprintmode`, `sneakmode`, `fly`, `swim`, `jump`, `fall`, `climb`, `floorsitting`, `dead`, `break`, `place`, `glide`, `mounted`
+
+**Key Discovery:** Trader shape uses different animation names:
+- `balanced-walk` (not "walk")
+- `balanced-run` (not "run")
+- `balanced-idle` (not "idle")
+
+## Pathfinding - WORKING!
+
+VS has built-in A* pathfinding in the `VSEssentials` mod. We expose it via `/bot/pathfind`.
+
+### Setup
+Add reference to VSEssentials.dll in your mod project:
+```xml
+<Reference Include="VSEssentials">
+  <HintPath>$(VINTAGE_STORY)/Mods/VSEssentials.dll</HintPath>
+  <Private>false</Private>
+</Reference>
+```
+
+### Usage
+```csharp
+using Vintagestory.Essentials;
+
+// Initialize once
+_astar = new AStar(api);
+
+// Find path
+List<Vec3d> waypoints = _astar.FindPathAsWaypoints(
+    startPos,           // BlockPos
+    endPos,             // BlockPos
+    maxFallHeight,      // int (e.g., 4)
+    stepHeight,         // float (e.g., 0.6f)
+    entityCollisionBox, // Cuboidf
+    searchDepth,        // int (default 9999)
+    mhdistanceTolerance,// int (default 0)
+    EnumAICreatureType.Humanoid
+);
+```
+
+### API Endpoint
+```bash
+curl -X POST http://localhost:4560/bot/pathfind \
+  -H "Content-Type: application/json" \
+  -d '{"x": 512140, "y": 123, "z": 511870}'
+
+# Response:
+{
+  "success": true,
+  "waypointCount": 10,
+  "distance": 11.49,
+  "waypoints": [
+    {"x": 512131.49, "y": 123, "z": 511864.41},
+    ...
+  ]
+}
+```
+
+### How It Works Now
+With the custom AI task approach, you just call `/bot/goto` and `NavigateTo()` handles pathfinding internally. The `/bot/pathfind` endpoint is available for debugging or manual path inspection.
+
+### Pathfinding Parameters (for /bot/pathfind endpoint)
+- **stepHeight:** Default 1.2 (must be >1.0 to handle 1-block terrain steps)
+- **maxFallHeight:** Default 4 blocks
+- **searchDepth:** Default 9999. Increase for very long paths
+
+### Important: Target Y Coordinate
+The target Y must be at actual ground level (where the bot can stand). If target Y is in the air, the bot will reach X/Z but report "stuck" because it can't reach a floating point.
+
+## Entity Types Comparison
+
+| Entity Type | Has PathTraverser | Has Own AI | Controllable | Notes |
+|-------------|-------------------|------------|--------------|-------|
+| `playerbot` | NO | NO | Partially | No pathfinding infrastructure |
+| `humanoid-trader-*` | YES | YES | NO | AI interferes with control |
+| `chicken-rooster` | YES | YES | NO | AI makes it flee |
+| `vsai:aibot` (custom) | YES | Custom (remote-controlled) | YES | **Our solution!** |
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/status` | GET | Server status, player count, bot status |
+| `/player/observe` | GET | Player position & world info |
+| `/bot/spawn` | POST | Spawn bot entity (default: vsai:aibot) |
+| `/bot/despawn` | POST | Remove tracked bot |
+| `/bot/cleanup` | POST | Kill ALL aibot entities in world |
+| `/bot/observe` | GET | Bot position, rotation, state |
+| `/bot/blocks?radius=N` | GET | Blocks around bot |
+| `/bot/entities?radius=N` | GET | Entities around bot |
+| `/bot/move` | POST | Teleport bot to position |
+| `/bot/goto` | POST | Walk to position (uses NavigateTo pathfinding) |
+| `/bot/walk` | POST | Set movement controls |
+| `/bot/stop` | POST | Stop movement |
+| `/bot/break` | POST | Break block at position |
+| `/bot/place` | POST | Place block at position |
+| `/bot/pathfind` | POST | Calculate path using VS AStar (returns waypoints) |
+| `/bot/movement/status` | GET | Get current movement status (for async polling) |
+| `/screenshot` | POST | Take screenshot (macOS, requires Screen Recording permission) |
+
+### Movement Status Endpoint
+
+The `/bot/movement/status` endpoint enables async movement monitoring - critical for MCP tool integration.
+
+```bash
+curl -s http://localhost:4560/bot/movement/status
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "status": "moving",           // idle, pending, moving, reached, stuck
+    "statusMessage": "Moving to (100.0, 72.0, 100.0)",
+    "position": { "x": 95.5, "y": 72.0, "z": 95.5 },
+    "target": { "x": 100.0, "y": 72.0, "z": 100.0 },
+    "isActive": true,
+    "onGround": true
+}
+```
+
+**MCP Tool Pattern:**
+1. Issue `/bot/goto` command
+2. Poll `/bot/movement/status` every 100ms
+3. Collect position samples
+4. Return complete movement trace when status is "reached" or "stuck"
+
+This allows LLM agents to issue a single tool call and receive the full result.
+
+## Key VS Modding Concepts
+
+### Server vs Client Authority
+- **Player movement:** Client is authoritative - server cannot override
+- **Entity movement:** Server is authoritative - can be controlled from server
+- **Position sync:** Update `ServerPos`, then call `Pos.SetFrom(ServerPos)`
+
+### Threading
+- HTTP requests come in on background threads
+- Game state modifications must be done on main thread:
+```csharp
+_serverApi.Event.EnqueueMainThreadTask(() => {
+    // Safe to modify game state here
+}, "TaskName");
+```
+
+### Game Tick Listener
+For continuous updates (like movement):
+```csharp
+// Register (returns listener ID for later removal)
+long id = _serverApi.Event.RegisterGameTickListener(MyTickHandler, 50); // 50ms interval
+
+// Unregister when done
+_serverApi.Event.UnregisterGameTickListener(id);
+```
+
+### Block Manipulation
+```csharp
+// Break block
+blockAccessor.SetBlock(0, blockPos);  // 0 = air
+blockAccessor.TriggerNeighbourBlockUpdate(blockPos);
+
+// Place block
+var block = world.GetBlock(new AssetLocation("game:dirt"));
+blockAccessor.SetBlock(block.BlockId, blockPos);
+
+// Place torch
+blockAccessor.SetBlock(world.GetBlock(new AssetLocation("torch-basic-lit-up")).BlockId, blockPos);
+```
+
+## Common Errors & Solutions
+
+### "Entity shape not found... Entity will be invisible!"
+- **Cause:** Shape path references another mod but VS looks in your mod first
+- **Solution:** Copy the shape JSON file into your mod's `assets/[modid]/shapes/` folder
+
+### Animation trigger "onControls" parse error
+- **Cause:** Using control names like "forward" instead of EnumEntityActivity values
+- **Solution:** Use activity names like "Walk", "Sprint", or remove triggeredBy and trigger manually
+
+### Entity spawns but doesn't move with PathTraverser
+- **Cause:** PathTraverser needs to be called from within an active AI task
+- **Solution:** Create a custom AI task that calls `pathTraverser.NavigateTo()` - see Approach 6
+
+### Bot gets stuck on 1-block steps
+- **Cause:** `stepHeight` in `controlledphysics` is too low (default 0.6)
+- **Solution:** Set `stepHeight: 1.01` on BOTH client and server controlledphysics behaviors
+
+### Pathfinder returns "No path found" for nearby valid destinations
+- **Cause:** Default `stepHeight` (0.6) is too low to handle 1-block terrain rises
+- **Solution:** Use `stepHeight >= 1.1` for natural terrain with 1-block elevation changes
+- **Note:** Pathfinder expects AIR block coordinates (where entity stands), not ground block coordinates. Use `ServerPos.AsBlockPos` directly without Y adjustment.
+
+### Pathfinder coordinate system
+- **Pathfinder expects:** Air block Y coordinate (where entity's feet are)
+- **NOT:** Ground block Y coordinate (what entity stands ON)
+- **Example:** Bot stands at Y=122 (air) on ground at Y=121 (soil) → pass Y=122 to pathfinder
+- **Caller must provide:** Target Y at the air level where bot should end up standing
+
+## File Locations
+
+- **VS Installation:** `/Applications/Vintage Story.app`
+- **Mods folder:** `~/Library/Application Support/VintageStoryData/Mods/`
+- **Server logs:** `~/Library/Application Support/VintageStoryData/Logs/server-main.log`
+- **Client logs:** `~/Library/Application Support/VintageStoryData/Logs/client-main.log`
+- **Build command:** `VINTAGE_STORY="/Applications/Vintage Story.app" dotnet build`
+
+## Project Structure
+
+```
+VintageStory-AI/
+├── LEARNINGS.md            # This file
+├── CLAUDE.md               # Claude Code instructions
+├── mod/                    # C# Vintage Story mod (git repo)
+│   ├── mod.csproj          # References VintagestoryAPI.dll, VSEssentials.dll
+│   ├── modinfo.json        # Mod metadata (type: "Code")
+│   ├── VsaiModSystem.cs    # Main mod code with HTTP server
+│   ├── AiTaskRemoteControl.cs  # Custom AI task for remote control
+│   └── assets/
+│       └── vsai/
+│           ├── entities/
+│           │   └── aibot.json
+│           ├── shapes/
+│           │   └── entity/humanoid/
+│           │       └── trader.json   # Copied from survival mod
+│           └── textures/
+│               └── entity/humanoid/
+│                   └── trader.png    # Copied from survival mod
+└── tools/                  # Python tools (git repo)
+    └── bot_move.py         # CLI tool for movement testing
+```
+
+## Python CLI Tool (bot_move.py)
+
+A CLI tool that demonstrates the MCP async movement pattern:
+
+```bash
+# Move to absolute position
+python3 tools/bot_move.py 100 72 100
+
+# Relative movement
+python3 tools/bot_move.py 5 0 5 --relative
+
+# Custom speed
+python3 tools/bot_move.py 100 72 100 --speed 0.06
+
+# Faster polling
+python3 tools/bot_move.py 100 72 100 --poll-interval 50
+```
+
+**What it does:**
+1. Gets initial position from `/bot/movement/status`
+2. Issues POST to `/bot/goto`
+3. Polls `/bot/movement/status` every 100ms
+4. Prints real-time progress
+5. Returns summary with distance, time, samples
+
+**Sample output:**
+```
+Starting position: (100.50, 72.00, 100.50)
+Target position: (105.50, 72.00, 105.50)
+Distance: 7.07 blocks
+
+Movement started, polling status...
+--------------------------------------------------
+  [ 0.10s] (100.60, 72.00, 100.60) | status=moving | to_target=6.93
+  [ 2.35s] (105.50, 72.00, 105.50) | status=reached | to_target=0.12
+--------------------------------------------------
+
+MOVEMENT RESULT: ✓ reached
+Total traveled: 6.60 blocks
+Elapsed time: 2.12s
+Average speed: 3.15 blocks/s
+```
+
+## Resources
+
+- [VS API Docs](https://apidocs.vintagestory.at/)
+- [VS Modding Wiki](https://wiki.vintagestory.at/Modding:Entity_Behaviors)
+- [vsapi source](https://github.com/anegostudios/vsapi) - API source code
+- [vssurvivalmod source](https://github.com/anegostudios/vssurvivalmod) - Contains AI task implementations
+
+## Hostile Creature Targeting
+
+### Do Hostile Creatures Attack the Bot?
+
+**By default, NO.** Hostile creatures like drifters use AI tasks with `entityCodes` that specify valid targets:
+
+```json
+{
+    "code": "meleeattack",
+    "entityCodes": ["player"],
+    ...
+}
+```
+
+Our bot has entity code `"aibot"` and uses class `EntityAgent` (not `EntityPlayer`), so it doesn't match `"player"` and is ignored.
+
+### Making the Bot Attackable (Future Enhancement)
+
+**Option 1: JSON Patch (Recommended)**
+
+Add a patch file in the mod to add `"aibot"` to hostile creature target lists:
+
+```
+mod/assets/vsai/patches/hostile-targeting.json
+```
+
+```json
+[
+    {
+        "op": "add",
+        "path": "/server/behaviors/*/aitasks/*/entityCodes/-",
+        "value": "aibot",
+        "file": "game:entities/land/drifter-*.json",
+        "condition": {
+            "path": "/server/behaviors/*/aitasks/*/code",
+            "value": "meleeattack"
+        }
+    }
+]
+```
+
+**Note:** The exact patch syntax may need refinement - VS JSON patching has specific rules for wildcard paths.
+
+**Creatures to patch:**
+- `drifter-*` (surface, deep, tainted, corrupt, nightmare)
+- `wolf-*`
+- `bear-*`
+- `hyena-*`
+- `locust-*`
+- Other hostile mobs
+
+**Option 2: Change Bot Entity Code**
+
+Could potentially use an entity code that already matches hostile targeting (e.g., wildcards like `humanoid-*`), but this risks:
+- Breaking other mod interactions
+- Unintended targeting by other systems
+- Not recommended
+
+### Relevant VS Modding Docs
+
+- [AiTaskBaseTargetable](https://wiki.vintagestory.at/Modding:AiTaskBaseTargetable) - Target selection properties
+- [Entity Behavior taskai](https://wiki.vintagestory.at/Modding:Entity_Behavior_taskai) - AI task system
+- [JSON Patching](https://wiki.vintagestory.at/Modding:JSON_Patching) - How to patch entity files
+
+### Key Properties for Target Selection
+
+| Property | Description |
+|----------|-------------|
+| `entityCodes` | List of entity codes to target (exact or wildcard with `*` suffix) |
+| `skipEntityCodes` | List of entity codes to never target |
+| `friendlyTarget` | Override hostility restrictions when true |
+| `creatureHostility` | World config (aggressive/passive/off) affects player targeting |
+
+## Bot Inventory (Future Enhancement)
+
+### EntityAgent Inventory Basics
+
+The `EntityAgent` class has built-in item slot support:
+
+| Property | Description |
+|----------|-------------|
+| `LeftHandItemSlot` | Item in left hand |
+| `RightHandItemSlot` | Item in right hand |
+| `ActiveHandItemSlot` | Currently active hand item |
+| `TryGiveItemStack()` | Method to give items to entity |
+| `WalkInventory()` | Traverse all inventory slots |
+
+### Entity Behaviors for Inventory
+
+VS uses behaviors to add inventory functionality:
+
+| Behavior | Description | Used By |
+|----------|-------------|---------|
+| `collectitems` | Auto-pickup items from ground | player, bot, raccoon |
+| `playerinventory` | Full player inventory system | player |
+| `mouthinventory` | Simple carry slot | raccoon |
+| `villagerinventory` | Villager-specific inventory | villagers |
+| `seraphinventory` | Armor stand / playerbot inventory | playerbot |
+| `harvestable` | Drop inventory on death | animals |
+
+### Implementation Plan
+
+**Goal:** Player-like inventory for the bot
+
+**Options to investigate:**
+1. **`playerinventory` behavior** - May require EntityPlayer class, might not work with EntityAgent
+2. **`seraphinventory` behavior** - Used by playerbot entity, designed for non-player entities
+3. **Custom inventory behavior** - Create our own based on existing behaviors
+
+**API Endpoints needed:**
+- `/bot/inventory` - GET current inventory contents
+- `/bot/inventory/pickup` - POST pick up specific item
+- `/bot/inventory/drop` - POST drop item at position
+- `/bot/inventory/equip` - POST equip item to hand slot
+- `/bot/inventory/use` - POST use held item
+
+**Entity JSON changes:**
+```json
+{
+    "server": {
+        "behaviors": [
+            { "code": "collectitems" },  // Auto-pickup nearby items
+            { "code": "seraphinventory" } // Or playerinventory or custom
+        ]
+    }
+}
+```
+
+### Relevant VS Modding Docs
+
+- [Entity Behaviors](https://wiki.vintagestory.at/Modding:Entity_Behaviors)
+- [EntityAgent API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.EntityAgent.html)
+- [Basic Inventory Handling](https://wiki.vintagestory.at/Modding:Basic_Inventory_Handling)
+
+## Bot Hunger/Satiety (Future Enhancement)
+
+### Does the Bot Get Hungry?
+
+**By default, NO.** The hunger/satiety system is controlled by the `hunger` entity behavior, which is only applied to players by default.
+
+### How Hunger Works in VS
+
+- `currentsaturation` - Current fullness level (float)
+- `maxsaturation` - Maximum capacity (1500 for player)
+- Saturation depletes over time
+- When empty, entity takes damage
+- Food restores saturation with nutritional categories (fruit, vegetable, grain, protein, dairy)
+
+### Adding Hunger to the Bot
+
+**Entity JSON changes:**
+```json
+{
+    "server": {
+        "behaviors": [
+            { "code": "hunger", "currentsaturation": 1500, "maxsaturation": 1500 }
+        ]
+    }
+}
+```
+
+**EntityAgent API:**
+- `ReceiveSaturation(float saturation, EnumFoodCategory foodCat, float saturationLossDelay, float nutritionGainMultiplier)` - Feed the entity
+- `ShouldReceiveSaturation(...)` - Check if entity can receive food
+
+### Implementation Considerations
+
+1. **Default behavior designed for players** - May have edge cases for non-player entities
+2. **Farm Life mod example** - Adds custom hunger to animals with grazing, feeding from troughs
+3. **May need custom behavior** - Override `ShouldReceiveSaturation()` if default doesn't work
+
+### API Endpoints needed
+
+- `/bot/hunger` - GET current saturation status
+- `/bot/feed` - POST feed the bot with food item
+
+### Relevant VS Modding Docs
+
+- [Satiety - Vintage Story Wiki](https://wiki.vintagestory.at/Satiety)
+- [Entity Behaviors](https://wiki.vintagestory.at/Modding:Entity_Behaviors)
+- [EntityAgent API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.EntityAgent.html)
+
+## Bot Crafting (Future Enhancement)
+
+### VS Crafting Systems
+
+Vintage Story has **5 distinct crafting systems**:
+
+| System | Description | Automatable? |
+|--------|-------------|--------------|
+| Grid crafting | 3×3 pattern matching | Potentially |
+| Knapping | Interactive voxel removal for flint/stone tools | No - manual GUI |
+| Clay forming | Voxel placement for pottery | No - manual GUI |
+| Smithing | Anvil hammer strikes for metal tools | No - manual GUI |
+| Casting | Pouring molten metal into molds | No - manual GUI |
+
+**Key limitation:** Most tool creation (flint, stone, metal) requires interactive GUI processes, not simple grid crafting.
+
+### Grid Crafting API
+
+The `GridRecipe` class has methods for programmatic recipe handling:
+
+```csharp
+// Check if items match a recipe
+bool matches = recipe.Matches(ingredientStacks);
+
+// Remove input items
+recipe.ConsumeInput(player, ingredientSlots, gridWidth);
+
+// Create output item
+ItemStack output = recipe.GenerateOutputStack(api, ingredientSlots);
+```
+
+**Problem:** There's no documented way to:
+- Look up recipes by ingredients
+- Execute recipes from an EntityAgent
+- Access the recipe registry programmatically
+
+Crafting is tied to player GUI interaction, not entity behavior.
+
+### Implementation Options
+
+**Option 1: "Simulated" Crafting (Recommended)**
+
+Build a custom system that:
+1. Maintains a simplified recipe database (JSON)
+2. Checks bot inventory against known recipes
+3. Removes ingredients and spawns output item
+
+```csharp
+// Pseudo-code
+if (HasItems(bot, "stick", 1) && HasItems(bot, "flint", 2))
+{
+    RemoveItems(bot, "stick", 1);
+    RemoveItems(bot, "flint", 2);
+    GiveItem(bot, "game:axe-flint");
+}
+```
+
+**Limitations:**
+- Only works for grid recipes we manually define
+- Skips knapping/smithing/clay entirely
+- Not "real" crafting, just item transformation
+
+**Option 2: Access Internal APIs**
+
+Use reflection to access recipe registry:
+- Fragile, may break with VS updates
+- Not officially supported
+- Could enable proper recipe lookup
+
+**Option 3: Knapping Simulation**
+
+For flint/stone tools that require knapping:
+- Define the final tool shapes
+- Skip the voxel removal process
+- Just check for raw materials and spawn tool
+
+### API Endpoints Needed
+
+- `/bot/recipes` - GET available recipes bot can craft
+- `/bot/craft` - POST craft item by recipe name
+- `/bot/cancraft` - GET check if bot has materials for recipe
+
+### What the Bot CAN'T Craft (Interactive Only)
+
+- Flint tools (knapping required)
+- Stone tools (knapping required)
+- Clay items (clay forming + kiln)
+- Metal tools (smithing on anvil)
+- Cast items (crucible + mold)
+
+### What the Bot COULD Craft (Grid Recipes)
+
+- Planks from logs
+- Sticks from planks
+- Torches
+- Rope
+- Some food items
+- Storage containers
+- Basic blocks
+
+### Relevant VS Modding Docs
+
+- [GridRecipe API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.GridRecipe.html)
+- [Grid Recipes Guide](https://wiki.vintagestory.at/Modding:Grid_Recipes_Guide)
+- [Crafting Wiki](https://wiki.vintagestory.at/Crafting)
+- [Knapping Wiki](https://wiki.vintagestory.at/Knapping)
+
+## Bot Mining (Future Enhancement)
+
+### Current Implementation (Cheat Mode)
+
+The current `/bot/break` endpoint bypasses tool requirements:
+
+```csharp
+block.GetDrops(_serverApi.World, blockPos, null);  // null = no tool check
+blockAccessor.SetBlock(0, blockPos);  // Instant break
+```
+
+**Result:** Bot can break ANY block instantly without tools, always gets drops.
+
+### How VS Mining Actually Works
+
+**Block properties that control mining:**
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `requiredminingtier` | int (0-5) | Minimum tool tier to get drops |
+| `resistance` | float | Breaking time in seconds (0.5 to 60) |
+| `blockmaterial` | enum | Stone, Metal, Wood, Soil - affects tool speed |
+
+**Tool tier hierarchy:**
+
+| Tier | Materials |
+|------|-----------|
+| 0 | Metal scraps (emergency tools) |
+| 1 | Stone, flint |
+| 2 | Copper, gold, silver |
+| 3 | Bronze alloys |
+| 4 | Iron, meteoric iron |
+| 5 | Steel |
+
+**Example:** Copper ore requires tier 2+. Using flint pickaxe (tier 1) = block breaks but NO DROPS.
+
+### Tool-Conditional Drops
+
+Blocks can specify different drops based on tool:
+
+```json
+"drops": [
+  { "code": "ore-copper", "tool": "pickaxe" },
+  { "code": "rockdust", "tool": "*" }
+]
+```
+
+### API Methods for Mining
+
+| Method | Description |
+|--------|-------------|
+| `block.GetDrops(world, pos, player)` | Returns drops based on player's tool |
+| `block.RequiredMiningTier` | Get minimum tier needed |
+| `block.Resistance` | Get breaking time |
+| `tool.ToolTier` | Get tool's mining tier |
+| `tool.MiningSpeed[material]` | Get speed multiplier for material |
+
+### Proper Bot Mining Implementation
+
+To implement realistic mining:
+
+1. **Require inventory system** - Bot needs to hold tools
+2. **Check tool compatibility:**
+   ```csharp
+   var tool = botEntity.RightHandItemSlot?.Itemstack?.Collectible;
+   int toolTier = tool?.ToolTier ?? 0;
+   int requiredTier = block.RequiredMiningTier;
+
+   if (toolTier < requiredTier) {
+       // Can break but no drops
+   }
+   ```
+3. **Simulate mining time:**
+   ```csharp
+   float miningSpeed = tool?.MiningSpeed[block.BlockMaterial] ?? 1f;
+   float breakTime = block.Resistance / miningSpeed;
+   // Wait breakTime seconds before breaking
+   ```
+4. **Pass player/tool to GetDrops:**
+   ```csharp
+   // Need IPlayer or tool context for proper drops
+   var drops = block.GetDrops(world, pos, playerWithTool);
+   ```
+
+### API Endpoints Needed
+
+- `/bot/mine` - POST mine block with equipped tool (respects tier/time)
+- `/bot/break` - POST instant break (current cheat mode, for testing)
+- `/bot/canmine` - GET check if bot can mine block with current tool
+
+### Implementation Order
+
+Mining depends on inventory system:
+1. Implement inventory (hold tools)
+2. Implement tool equipping
+3. Implement proper mining with tier checks
+4. Add mining time delays
+
+### Relevant VS Modding Docs
+
+- [Mining Wiki](https://wiki.vintagestory.at/Mining)
+- [Tools Wiki](https://wiki.vintagestory.at/Tools)
+- [Block JSON Properties](https://wiki.vintagestory.at/Modding:Block_Json_Properties)
+- [Block API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.Block.html)
+- [CollectibleObject API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.CollectibleObject.html)
+
+## Next Steps
+
+1. ~~**Fix walking animation**~~ - DONE! Use `triggeredBy.onControls` in entity JSON
+2. ~~**Add pathfinding**~~ - DONE! Using VS AStar via `/bot/pathfind` endpoint
+3. ~~**Fix terrain handling**~~ - DONE! Using custom AI task with NavigateTo + stepHeight=1.01
+4. ~~**Movement status endpoint**~~ - DONE! `/bot/movement/status` for async polling
+5. ~~**Python CLI tool**~~ - DONE! `tools/bot_move.py` demonstrates MCP pattern
+6. ~~**MCP Server**~~ - DONE! Python MCP server with visibility filtering
+7. ~~**Ground-level targeting**~~ - DONE! Auto-detect ground Y at target X/Z coordinates
+8. **Hostile creature targeting** - JSON patch to make creatures attack the bot
+9. **Inventory management** - Player-like inventory with pickup/drop/equip/use
+10. **Hunger/satiety system** - Add hunger behavior, feeding endpoints
+11. **Crafting system** - Simulated grid crafting for basic recipes
+12. **Mining system** - Tool tier checks, mining time, proper drops
+13. **Combat** - Attack entities, defend
+
+## Key Insights from Session 6
+
+1. **Target Y matters:** When giving movement targets, the Y coordinate must be at actual ground level. If target Y is in the air (no ground), bot will reach X/Z but report "stuck" because it can't reach floating point.
+
+2. **Two movement systems:**
+   - `WalkTowards()` - straight line, no pathfinding
+   - `NavigateTo()` - A* pathfinding around obstacles
+
+3. **Physics doesn't jump:** The `controlledphysics` behavior only "glides up" within stepHeight. It never triggers actual jumps. For full-block terrain, stepHeight must be >= 1.01.
+
+4. **stepHeight on both sides:** Must set stepHeight in controlledphysics on BOTH client AND server behaviors in entity JSON.
+
+## Key Insights from Session 7
+
+1. **MCP Server:** Built Python MCP server (`mcp-server/vsai_server.py`) with tools for all bot endpoints. `bot_goto` blocks until movement completes.
+
+2. **Line-of-sight visibility:** Created `vintage-story-core` Python library with voxel raycast algorithm (Amanatides & Woo) to filter blocks to only those visible from bot's position. Reduces block scan from 713 to ~24 visible surface blocks.
+
+3. **Cleanup on spawn:** Modified `/bot/spawn` to automatically cleanup all existing aibot entities before spawning new one. Prevents orphaned bots accumulating.
+
+4. **Ground-level auto-detection:** `/bot/goto` now automatically finds ground level at target X,Z coordinates. Scans downward to find first solid block, uses Y+1 as standing position.
+
+5. **Bot health:** Bot has 20 HP (like player), takes fall damage, has hurt/death sounds configured.
+
+6. **Hostile targeting:** Hostile creatures (drifters, wolves) do NOT attack the bot by default - they only target `"player"` entity code. Can be changed via JSON patch to add `"aibot"` to their `entityCodes` target list.
+
+## Key Insights from Session 8
+
+1. **Loose stones/flint block codes:** Flint and loose stones have specific naming:
+   - **Flint:** `looseflints-{rocktype}-free` (e.g., `looseflints-bauxite-free`)
+   - **Stones:** `loosestones-{rocktype}-free` (e.g., `loosestones-bauxite-free`)
+   - NOT `loosestones-flint` as might be assumed!
+
+2. **Non-solid surface blocks now included:** Loose stones, flints, and plants have `isSolid: false`. The "surface" visibility filter now includes non-solid blocks that rest on solid ground (have a solid block at y-1). This was fixed in Session 8 - previously these were excluded.
+
+3. **Block scanning for exploration:** When searching for specific items like flint:
+   - The default `visibility_filter: "surface"` now includes loose items on the ground
+   - Search for both `looseflints-*` AND `loosestones-*` patterns
+   - The rock type suffix (bauxite, granite, etc.) indicates the underlying rock type, not the stone/flint type
+
+4. **Player-relative coordinates:** The API returns absolute world coordinates (e.g., 512206, 120, 511851), but players see coordinates relative to world spawn. To convert:
+   - **Relative X** = Absolute X - 512000
+   - **Relative Y** = Absolute Y (height is absolute)
+   - **Relative Z** = Absolute Z - 512000
+   - Example: (512206, 120, 511851) → (206, 120, -149)
+   - Always use relative coordinates when communicating positions to players via chat
+
+## Project Structure Update
+
+```
+VintageStory-AI/
+├── LEARNINGS.md              # This file
+├── CLAUDE.md                 # Claude Code instructions
+├── .mcp.json                 # MCP server config for Claude Code
+├── mod/                      # C# Vintage Story mod (git repo)
+│   └── ...
+├── mcp-server/               # Python MCP server (git repo)
+│   ├── vsai_server.py        # MCP server with 13 tools
+│   ├── requirements.txt      # mcp>=1.0.0
+│   └── pyproject.toml
+├── python-vs-core/           # Python library (git repo)
+│   ├── src/vintage_story_core/
+│   │   ├── __init__.py
+│   │   ├── types.py          # Vec3, BlockInfo
+│   │   └── visibility.py     # Line-of-sight filtering
+│   ├── pyproject.toml
+│   └── README.md
+└── tools/                    # Python tools (git repo)
+    └── bot_move.py           # CLI tool for movement testing
+```
+
+---
+*Last updated: Session 8*

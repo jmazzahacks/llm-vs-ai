@@ -1,0 +1,134 @@
+{
+    "code": "aibot",
+    "class": "EntityAgent",
+    "hitboxSize": {
+        "x": 0.6,
+        "y": 1.75
+    },
+    "deadHitboxSize": {
+        "x": 0.6,
+        "y": 0.25
+    },
+    "eyeHeight": 1.6,
+    "weight": 70,
+    "canClimb": true,
+    "canClimbAnywhere": false,
+    "fallDamage": true,
+    "climbTouchDistance": 0.5,
+    "rotateTpOnSelf": true,
+    "client": {
+        "renderer": "Shape",
+        "shape": {
+            "base": "entity/humanoid/trader"
+        },
+        "texture": {
+            "base": "entity/humanoid/trader"
+        },
+        "glowLevel": 0,
+        "size": 1.0,
+        "behaviors": [
+            {
+                "code": "repulseagents",
+                "collisionBoxTrigger": true
+            },
+            {
+                "code": "controlledphysics",
+                "stepHeight": 1.01
+            },
+            {
+                "code": "interpolateposition"
+            }
+        ],
+        "animations": [
+            {
+                "code": "idle",
+                "animation": "balanced-idle",
+                "weight": 1,
+                "animationSpeed": 1,
+                "triggeredBy": { "defaultAnim": true }
+            },
+            {
+                "code": "walk",
+                "animation": "balanced-walk",
+                "weight": 10,
+                "animationSpeed": 1.5,
+                "triggeredBy": {
+                    "onControls": ["move"],
+                    "matchExact": false
+                }
+            },
+            {
+                "code": "run",
+                "animation": "balanced-run",
+                "weight": 10,
+                "animationSpeed": 1.5,
+                "triggeredBy": {
+                    "onControls": ["move", "sprintmode"],
+                    "matchExact": true
+                }
+            },
+            {
+                "code": "jump",
+                "animation": "jump",
+                "weight": 10,
+                "animationSpeed": 1.25
+            },
+            {
+                "code": "die",
+                "animation": "die",
+                "weight": 10,
+                "animationSpeed": 1
+            }
+        ]
+    },
+    "server": {
+        "attributes": {
+            "pathfinder": {
+                "minTurnAnglePerSec": 360,
+                "maxTurnAnglePerSec": 720
+            }
+        },
+        "behaviors": [
+            {
+                "code": "repulseagents",
+                "collisionBoxTrigger": true
+            },
+            {
+                "code": "controlledphysics",
+                "stepHeight": 1.01
+            },
+            {
+                "code": "health",
+                "currenthealth": 20,
+                "maxhealth": 20
+            },
+            {
+                "code": "floatupwhenstuck",
+                "onlyWhenDead": false
+            },
+            {
+                "code": "taskai",
+                "aiCreatureType": "LandCreature",
+                "aitasks": [
+                    {
+                        "code": "vsai:remotecontrol",
+                        "priority": 999,
+                        "movespeed": 0.03
+                    }
+                ]
+            }
+        ],
+        "spawnConditions": {
+            "worldgen": {
+                "group": "none"
+            },
+            "runtime": {
+                "group": "none"
+            }
+        }
+    },
+    "sounds": {
+        "hurt": "game:creature/humanoid-hurt",
+        "death": "game:creature/humanoid-death"
+    }
+}
