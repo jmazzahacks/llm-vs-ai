@@ -21,7 +21,7 @@ from vintage_story_core import filter_visible_blocks, get_visible_surface_blocks
 # Configuration
 VS_API_BASE_URL = "http://localhost:4560"
 MOVEMENT_POLL_INTERVAL_SEC = 0.1
-MOVEMENT_TIMEOUT_SEC = 120
+MOVEMENT_TIMEOUT_SEC = 600  # 10 minutes - complex terrain needs long winding paths
 
 
 @dataclass
