@@ -266,6 +266,53 @@ async def list_tools() -> list[Tool]:
                 "properties": {},
                 "required": []
             }
+        ),
+        Tool(
+            name="bot_inventory",
+            description="Get the contents of the bot's inventory, including all slots and hand items.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
+            name="bot_collect",
+            description="Pick up a loose surface item (flint, stones, sticks) at a specific position. Bot must be within 5 blocks of the target.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Block X coordinate"},
+                    "y": {"type": "integer", "description": "Block Y coordinate"},
+                    "z": {"type": "integer", "description": "Block Z coordinate"}
+                },
+                "required": ["x", "y", "z"]
+            }
+        ),
+        Tool(
+            name="bot_inventory_drop",
+            description="Drop an item from the bot's inventory. Spawns the item in the world at the bot's feet.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "slotIndex": {"type": "integer", "description": "Inventory slot index to drop from (0-based)"},
+                    "itemCode": {"type": "string", "description": "Item code to search for and drop (alternative to slotIndex)"},
+                    "quantity": {"type": "integer", "description": "Number of items to drop (default: 1)", "default": 1}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="bot_pickup",
+            description="Pick up a dropped item entity near the bot. If no entityId specified, picks up the nearest item.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entityId": {"type": "integer", "description": "Specific item entity ID to pick up (from bot_entities)"},
+                    "maxDistance": {"type": "number", "description": "Maximum pickup distance (default: 5)", "default": 5}
+                },
+                "required": []
+            }
         )
     ]
 
@@ -444,6 +491,34 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
     elif name == "screenshot":
         return http_post("/screenshot", {})
+
+    elif name == "bot_inventory":
+        return http_get("/bot/inventory")
+
+    elif name == "bot_collect":
+        return http_post("/bot/collect", {
+            "x": arguments["x"],
+            "y": arguments["y"],
+            "z": arguments["z"]
+        })
+
+    elif name == "bot_inventory_drop":
+        data: dict[str, Any] = {}
+        if "slotIndex" in arguments:
+            data["slotIndex"] = arguments["slotIndex"]
+        if "itemCode" in arguments:
+            data["itemCode"] = arguments["itemCode"]
+        if "quantity" in arguments:
+            data["quantity"] = arguments["quantity"]
+        return http_post("/bot/inventory/drop", data)
+
+    elif name == "bot_pickup":
+        data: dict[str, Any] = {}
+        if "entityId" in arguments:
+            data["entityId"] = arguments["entityId"]
+        if "maxDistance" in arguments:
+            data["maxDistance"] = arguments["maxDistance"]
+        return http_post("/bot/pickup", data)
 
     else:
         return {"error": f"Unknown tool: {name}"}

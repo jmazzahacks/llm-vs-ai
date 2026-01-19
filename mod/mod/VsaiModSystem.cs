@@ -291,6 +291,46 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/inventory":
+                    responseBody = HandleBotInventory();
+                    break;
+
+                case "/bot/collect":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotCollect(request);
+                    }
+                    break;
+
+                case "/bot/inventory/drop":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotDrop(request);
+                    }
+                    break;
+
+                case "/bot/pickup":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotPickup(request);
+                    }
+                    break;
+
                 case "/screenshot":
                     if (method != "POST")
                     {
@@ -1413,6 +1453,555 @@ public class VsaiModSystem : ModSystem
         {
             return JsonError($"Invalid JSON: {ex.Message}");
         }
+    }
+
+    private string HandleBotInventory()
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var inventoryBehavior = agent.GetBehavior<EntityBehaviorSeraphInventory>();
+        if (inventoryBehavior == null)
+        {
+            return JsonError("Bot has no inventory behavior configured");
+        }
+
+        var inventory = inventoryBehavior.Inventory;
+        if (inventory == null)
+        {
+            return JsonError("Bot inventory is null");
+        }
+
+        var slots = new List<object>();
+        for (int i = 0; i < inventory.Count; i++)
+        {
+            var slot = inventory[i];
+            if (slot?.Itemstack != null)
+            {
+                slots.Add(new
+                {
+                    index = i,
+                    code = slot.Itemstack.Collectible?.Code?.ToString() ?? "unknown",
+                    quantity = slot.Itemstack.StackSize,
+                    name = slot.Itemstack.GetName()
+                });
+            }
+            else
+            {
+                slots.Add(new
+                {
+                    index = i,
+                    code = (string?)null,
+                    quantity = 0,
+                    name = (string?)null
+                });
+            }
+        }
+
+        // Get hand items
+        object? leftHand = null;
+        object? rightHand = null;
+
+        if (agent.LeftHandItemSlot?.Itemstack != null)
+        {
+            leftHand = new
+            {
+                code = agent.LeftHandItemSlot.Itemstack.Collectible?.Code?.ToString() ?? "unknown",
+                quantity = agent.LeftHandItemSlot.Itemstack.StackSize,
+                name = agent.LeftHandItemSlot.Itemstack.GetName()
+            };
+        }
+
+        if (agent.RightHandItemSlot?.Itemstack != null)
+        {
+            rightHand = new
+            {
+                code = agent.RightHandItemSlot.Itemstack.Collectible?.Code?.ToString() ?? "unknown",
+                quantity = agent.RightHandItemSlot.Itemstack.StackSize,
+                name = agent.RightHandItemSlot.Itemstack.GetName()
+            };
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            slotCount = inventory.Count,
+            handLeft = leftHand,
+            handRight = rightHand,
+            slots = slots
+        });
+    }
+
+    private string HandleBotCollect(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide x, y, z coordinates.");
+        }
+
+        int x, y, z;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("x", out var xEl) ||
+                !root.TryGetProperty("y", out var yEl) ||
+                !root.TryGetProperty("z", out var zEl))
+            {
+                return JsonError("Missing x, y, or z coordinates");
+            }
+
+            x = xEl.GetInt32();
+            y = yEl.GetInt32();
+            z = zEl.GetInt32();
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+
+        // Check distance to target
+        var botPos = _botEntity.ServerPos.XYZ;
+        var targetPos = new Vec3d(x + 0.5, y + 0.5, z + 0.5);
+        var distance = botPos.DistanceTo(targetPos);
+
+        if (distance > 5.0)
+        {
+            return JsonError($"Too far to collect (distance: {distance:F1}, max: 5.0)");
+        }
+
+        var blockAccessor = _serverApi?.World?.BlockAccessor;
+        if (blockAccessor == null)
+        {
+            return JsonError("World not available");
+        }
+
+        var blockPos = new BlockPos(x, y, z, _botEntity.ServerPos.Dimension);
+        var block = blockAccessor.GetBlock(blockPos);
+
+        if (block == null || block.Code?.Path == "air")
+        {
+            return JsonError($"No block at position ({x}, {y}, {z})");
+        }
+
+        // Check if it's a collectible loose item
+        var blockCode = block.Code?.Path ?? "";
+        bool isLooseItem = blockCode.Contains("-free") ||
+                           blockCode.StartsWith("stick") ||
+                           blockCode.StartsWith("looseboulders") ||
+                           blockCode.StartsWith("looseflints") ||
+                           blockCode.StartsWith("loosestones") ||
+                           blockCode.StartsWith("looseores");
+
+        if (!isLooseItem)
+        {
+            return JsonError($"Block '{blockCode}' is not a collectible loose item");
+        }
+
+        // Execute on main thread
+        var collectedItems = new List<object>();
+        string? errorMsg = null;
+        var waitHandle = new ManualResetEventSlim(false);
+
+        _serverApi?.Event.EnqueueMainThreadTask(() =>
+        {
+            try
+            {
+                // Get drops before breaking
+                var drops = block.GetDrops(_serverApi.World, blockPos, null);
+
+                // Break the block (set to air)
+                blockAccessor.SetBlock(0, blockPos);
+                blockAccessor.TriggerNeighbourBlockUpdate(blockPos);
+
+                // Add drops directly to bot inventory
+                if (drops != null)
+                {
+                    foreach (var drop in drops)
+                    {
+                        var originalSize = drop.StackSize;
+                        bool given = agent.TryGiveItemStack(drop);
+
+                        int amountGiven = originalSize - drop.StackSize;
+                        if (amountGiven > 0)
+                        {
+                            collectedItems.Add(new
+                            {
+                                code = drop.Collectible?.Code?.ToString() ?? "unknown",
+                                quantity = amountGiven,
+                                name = drop.GetName()
+                            });
+                        }
+
+                        // If couldn't give all, spawn remainder in world
+                        if (drop.StackSize > 0)
+                        {
+                            _serverApi.World.SpawnItemEntity(drop, new Vec3d(x + 0.5, y + 0.5, z + 0.5));
+                            _serverApi.Logger.Warning($"[VSAI] Bot inventory full, spawned {drop.StackSize}x {drop.Collectible?.Code} in world");
+                        }
+                    }
+                }
+
+                _serverApi.Logger.Notification($"[VSAI] Bot collected {collectedItems.Count} item types from ({x}, {y}, {z})");
+            }
+            catch (Exception ex)
+            {
+                errorMsg = ex.Message;
+            }
+            finally
+            {
+                waitHandle.Set();
+            }
+        }, "VSAI-CollectItem");
+
+        waitHandle.Wait(5000);
+
+        if (errorMsg != null)
+        {
+            return JsonError(errorMsg);
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            position = new { x, y, z },
+            brokenBlock = blockCode,
+            collectedItems = collectedItems
+        });
+    }
+
+    private string HandleBotDrop(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var inventoryBehavior = agent.GetBehavior<EntityBehaviorSeraphInventory>();
+        if (inventoryBehavior == null)
+        {
+            return JsonError("Bot has no inventory behavior configured");
+        }
+
+        var inventory = inventoryBehavior.Inventory;
+        if (inventory == null)
+        {
+            return JsonError("Bot inventory is null");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide slotIndex or itemCode, and optionally quantity.");
+        }
+
+        int? slotIndex = null;
+        string? itemCode = null;
+        int quantity = 1;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("slotIndex", out var slotEl))
+            {
+                slotIndex = slotEl.GetInt32();
+            }
+
+            if (root.TryGetProperty("itemCode", out var codeEl))
+            {
+                itemCode = codeEl.GetString();
+            }
+
+            if (root.TryGetProperty("quantity", out var qtyEl))
+            {
+                quantity = qtyEl.GetInt32();
+            }
+
+            if (slotIndex == null && string.IsNullOrEmpty(itemCode))
+            {
+                return JsonError("Must provide either slotIndex or itemCode");
+            }
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+
+        // Find the slot to drop from
+        int targetSlotIndex = -1;
+
+        if (slotIndex.HasValue)
+        {
+            if (slotIndex.Value < 0 || slotIndex.Value >= inventory.Count)
+            {
+                return JsonError($"Slot index {slotIndex.Value} out of range (0-{inventory.Count - 1})");
+            }
+            targetSlotIndex = slotIndex.Value;
+        }
+        else if (!string.IsNullOrEmpty(itemCode))
+        {
+            // Find first slot with matching item code
+            for (int i = 0; i < inventory.Count; i++)
+            {
+                var slot = inventory[i];
+                if (slot?.Itemstack?.Collectible?.Code?.ToString()?.Contains(itemCode, StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    targetSlotIndex = i;
+                    break;
+                }
+            }
+
+            if (targetSlotIndex < 0)
+            {
+                return JsonError($"No item matching '{itemCode}' found in inventory");
+            }
+        }
+
+        var targetSlot = inventory[targetSlotIndex];
+        if (targetSlot?.Itemstack == null)
+        {
+            return JsonError($"Slot {targetSlotIndex} is empty");
+        }
+
+        // Execute drop on main thread
+        object? droppedItem = null;
+        string? errorMsg = null;
+        var waitHandle = new ManualResetEventSlim(false);
+
+        _serverApi?.Event.EnqueueMainThreadTask(() =>
+        {
+            try
+            {
+                int dropQuantity = Math.Min(quantity, targetSlot.Itemstack.StackSize);
+                var itemStack = targetSlot.TakeOut(dropQuantity);
+                targetSlot.MarkDirty();
+
+                if (itemStack != null)
+                {
+                    droppedItem = new
+                    {
+                        code = itemStack.Collectible?.Code?.ToString() ?? "unknown",
+                        quantity = itemStack.StackSize,
+                        name = itemStack.GetName()
+                    };
+
+                    // Spawn in world at bot's feet
+                    _serverApi.World.SpawnItemEntity(itemStack, _botEntity.ServerPos.XYZ);
+                    _serverApi.Logger.Notification($"[VSAI] Bot dropped {itemStack.StackSize}x {itemStack.Collectible?.Code}");
+                }
+            }
+            catch (Exception ex)
+            {
+                errorMsg = ex.Message;
+            }
+            finally
+            {
+                waitHandle.Set();
+            }
+        }, "VSAI-DropItem");
+
+        waitHandle.Wait(5000);
+
+        if (errorMsg != null)
+        {
+            return JsonError(errorMsg);
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            slotIndex = targetSlotIndex,
+            droppedItem = droppedItem
+        });
+    }
+
+    private string HandleBotPickup(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var body = ReadRequestBody(request);
+        long? entityId = null;
+        double maxDistance = 5.0;
+
+        if (!string.IsNullOrEmpty(body))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("entityId", out var idEl))
+                {
+                    entityId = idEl.GetInt64();
+                }
+
+                if (root.TryGetProperty("maxDistance", out var distEl))
+                {
+                    maxDistance = distEl.GetDouble();
+                }
+            }
+            catch (JsonException ex)
+            {
+                return JsonError($"Invalid JSON: {ex.Message}");
+            }
+        }
+
+        var botPos = _botEntity.ServerPos.XYZ;
+
+        // Find item entities near the bot
+        var nearbyItems = _serverApi?.World?.GetEntitiesAround(
+            botPos,
+            (float)maxDistance,
+            (float)maxDistance,
+            e => e is EntityItem
+        );
+
+        if (nearbyItems == null || nearbyItems.Length == 0)
+        {
+            return JsonError($"No item entities within {maxDistance} blocks");
+        }
+
+        // Find target entity
+        Entity? targetEntity = null;
+
+        if (entityId.HasValue)
+        {
+            foreach (var e in nearbyItems)
+            {
+                if (e.EntityId == entityId.Value)
+                {
+                    targetEntity = e;
+                    break;
+                }
+            }
+
+            if (targetEntity == null)
+            {
+                return JsonError($"Item entity {entityId.Value} not found within range");
+            }
+        }
+        else
+        {
+            // Find nearest item entity
+            double nearestDist = double.MaxValue;
+            foreach (var e in nearbyItems)
+            {
+                double dist = botPos.DistanceTo(e.Pos.XYZ);
+                if (dist < nearestDist)
+                {
+                    nearestDist = dist;
+                    targetEntity = e;
+                }
+            }
+        }
+
+        if (targetEntity is not EntityItem itemEntity)
+        {
+            return JsonError("Target is not an item entity");
+        }
+
+        // Execute pickup on main thread
+        object? pickedUpItem = null;
+        string? errorMsg = null;
+        var waitHandle = new ManualResetEventSlim(false);
+
+        _serverApi?.Event.EnqueueMainThreadTask(() =>
+        {
+            try
+            {
+                var itemStack = itemEntity.Itemstack;
+                if (itemStack == null)
+                {
+                    errorMsg = "Item entity has no itemstack";
+                    return;
+                }
+
+                var originalSize = itemStack.StackSize;
+                var stackToGive = itemStack.Clone();
+                bool given = agent.TryGiveItemStack(stackToGive);
+
+                // Check how many were actually given (stackToGive is modified by TryGiveItemStack)
+                int amountGiven = originalSize - stackToGive.StackSize;
+
+                if (given || amountGiven > 0)
+                {
+                    if (amountGiven == 0) amountGiven = originalSize; // If given is true, all were taken
+
+                    pickedUpItem = new
+                    {
+                        code = itemStack.Collectible?.Code?.ToString() ?? "unknown",
+                        quantity = amountGiven,
+                        name = itemStack.GetName()
+                    };
+
+                    // Despawn the item entity
+                    itemEntity.Die(EnumDespawnReason.PickedUp, null);
+
+                    _serverApi.Logger.Notification($"[VSAI] Bot picked up {amountGiven}x {itemStack.Collectible?.Code}");
+                }
+                else
+                {
+                    errorMsg = "Could not add item to inventory (full?)";
+                }
+            }
+            catch (Exception ex)
+            {
+                errorMsg = ex.Message;
+            }
+            finally
+            {
+                waitHandle.Set();
+            }
+        }, "VSAI-PickupItem");
+
+        waitHandle.Wait(5000);
+
+        if (errorMsg != null)
+        {
+            return JsonError(errorMsg);
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            entityId = targetEntity.EntityId,
+            pickedUpItem = pickedUpItem
+        });
     }
 
     private string HandleScreenshot(HttpListenerRequest request)

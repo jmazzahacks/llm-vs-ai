@@ -366,6 +366,10 @@ The target Y must be at actual ground level (where the bot can stand). If target
 | `/bot/place` | POST | Place block at position |
 | `/bot/pathfind` | POST | Calculate path using VS AStar (returns waypoints) |
 | `/bot/movement/status` | GET | Get current movement status (for async polling) |
+| `/bot/inventory` | GET | Get inventory contents (slots + hand items) |
+| `/bot/collect` | POST | Pick up loose surface item block at position |
+| `/bot/pickup` | POST | Pick up dropped item entity (nearest or by ID) |
+| `/bot/inventory/drop` | POST | Drop item from inventory to world |
 | `/screenshot` | POST | Take screenshot (macOS, requires Screen Recording permission) |
 
 ### Movement Status Endpoint
@@ -622,60 +626,175 @@ Could potentially use an entity code that already matches hostile targeting (e.g
 | `friendlyTarget` | Override hostility restrictions when true |
 | `creatureHostility` | World config (aggressive/passive/off) affects player targeting |
 
-## Bot Inventory (Future Enhancement)
+## Bot Inventory System - IMPLEMENTED!
 
-### EntityAgent Inventory Basics
+### Overview
 
-The `EntityAgent` class has built-in item slot support:
+The bot now has a full inventory system using the `seraphinventory` behavior. This provides ~4 inventory slots plus hand slots.
 
-| Property | Description |
-|----------|-------------|
-| `LeftHandItemSlot` | Item in left hand |
-| `RightHandItemSlot` | Item in right hand |
-| `ActiveHandItemSlot` | Currently active hand item |
-| `TryGiveItemStack()` | Method to give items to entity |
-| `WalkInventory()` | Traverse all inventory slots |
+**Key decision:** We chose **manual collection** over auto-pickup (`collectitems` behavior) because auto-pickup was deemed too aggressive for an AI-controlled bot. The bot must be explicitly commanded to pick up items.
 
-### Entity Behaviors for Inventory
+### Entity JSON Configuration
 
-VS uses behaviors to add inventory functionality:
+Added `seraphinventory` to both client and server behaviors:
 
-| Behavior | Description | Used By |
-|----------|-------------|---------|
-| `collectitems` | Auto-pickup items from ground | player, bot, raccoon |
-| `playerinventory` | Full player inventory system | player |
-| `mouthinventory` | Simple carry slot | raccoon |
-| `villagerinventory` | Villager-specific inventory | villagers |
-| `seraphinventory` | Armor stand / playerbot inventory | playerbot |
-| `harvestable` | Drop inventory on death | animals |
-
-### Implementation Plan
-
-**Goal:** Player-like inventory for the bot
-
-**Options to investigate:**
-1. **`playerinventory` behavior** - May require EntityPlayer class, might not work with EntityAgent
-2. **`seraphinventory` behavior** - Used by playerbot entity, designed for non-player entities
-3. **Custom inventory behavior** - Create our own based on existing behaviors
-
-**API Endpoints needed:**
-- `/bot/inventory` - GET current inventory contents
-- `/bot/inventory/pickup` - POST pick up specific item
-- `/bot/inventory/drop` - POST drop item at position
-- `/bot/inventory/equip` - POST equip item to hand slot
-- `/bot/inventory/use` - POST use held item
-
-**Entity JSON changes:**
 ```json
 {
+    "client": {
+        "behaviors": [
+            { "code": "seraphinventory" }
+        ]
+    },
     "server": {
         "behaviors": [
-            { "code": "collectitems" },  // Auto-pickup nearby items
-            { "code": "seraphinventory" } // Or playerinventory or custom
+            { "code": "seraphinventory" }
         ]
     }
 }
 ```
+
+### C# Implementation Details
+
+**Required reference:** VSSurvivalMod.dll (contains `EntityBehaviorSeraphInventory`)
+
+```csharp
+// Access inventory behavior
+var inventoryBehavior = agent.GetBehavior<EntityBehaviorSeraphInventory>();
+var inventory = inventoryBehavior.Inventory;
+
+// Give items to entity
+agent.TryGiveItemStack(itemStack);  // Returns true if successful
+
+// Access inventory slots
+var slot = inventory[slotIndex];
+var item = slot.Itemstack;
+
+// Take items from slot
+var taken = slot.TakeOut(quantity);
+slot.MarkDirty();
+
+// Access hand slots
+agent.LeftHandItemSlot
+agent.RightHandItemSlot
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/bot/inventory` | GET | Get all inventory slots and hand items |
+| `/bot/collect` | POST | Pick up loose surface item block at position |
+| `/bot/pickup` | POST | Pick up dropped item entity (nearest or by ID) |
+| `/bot/inventory/drop` | POST | Drop item from inventory to world |
+
+### /bot/inventory Response
+
+```json
+{
+    "success": true,
+    "slotCount": 4,
+    "handLeft": null,
+    "handRight": { "code": "game:flint", "quantity": 1, "name": "Flint" },
+    "slots": [
+        { "index": 0, "code": "game:stone-granite", "quantity": 3, "name": "Stone" },
+        { "index": 1, "code": null, "quantity": 0, "name": null },
+        ...
+    ]
+}
+```
+
+### /bot/collect Request/Response
+
+**Request:**
+```json
+{ "x": 512100, "y": 120, "z": 511850 }
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "position": { "x": 512100, "y": 120, "z": 511850 },
+    "brokenBlock": "looseflints-granite-free",
+    "collectedItems": [
+        { "code": "game:flint", "quantity": 1, "name": "Flint" }
+    ]
+}
+```
+
+**Constraints:**
+- Bot must be within 5 blocks of target
+- Only collectible loose items: `looseflints-*`, `loosestones-*`, `looseboulders-*`, `looseores-*`, `stick-*`, and blocks with `-free` suffix
+- If inventory is full, remaining items spawn in world
+
+### /bot/pickup Request/Response
+
+**Important distinction:**
+- `/bot/collect` - For **loose item blocks** (natural worldgen spawns like flint on ground)
+- `/bot/pickup` - For **dropped item entities** (items dropped by players or from breaking blocks)
+
+**Request (pick up nearest):**
+```json
+{}
+```
+
+**Request (by entity ID):**
+```json
+{ "entityId": 1130, "maxDistance": 5 }
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "entityId": 1130,
+    "pickedUpItem": { "code": "game:stick", "quantity": 1, "name": "Stick" }
+}
+```
+
+**Constraints:**
+- Bot must be within `maxDistance` blocks (default: 5)
+- Only picks up `EntityItem` entities (dropped items)
+- Item entity is despawned after pickup
+
+### /bot/inventory/drop Request/Response
+
+**Request (by slot index):**
+```json
+{ "slotIndex": 0, "quantity": 1 }
+```
+
+**Request (by item code):**
+```json
+{ "itemCode": "flint", "quantity": 2 }
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "slotIndex": 0,
+    "droppedItem": { "code": "game:flint", "quantity": 1, "name": "Flint" }
+}
+```
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `bot_inventory` | Get inventory contents |
+| `bot_collect` | Pick up loose item block at position |
+| `bot_pickup` | Pick up dropped item entity |
+| `bot_inventory_drop` | Drop item from inventory |
+
+### Typical Workflow
+
+1. Scan for loose items: `bot_blocks` with filter "flint,stone"
+2. Move near the item: `bot_goto` to a position near the target
+3. Collect the item: `bot_collect` with exact block coordinates
+4. Verify collection: `bot_inventory` to see what was picked up
+5. Return to base: `bot_goto` back to starting position
+6. Drop items: `bot_inventory_drop` to deposit items
 
 ### Relevant VS Modding Docs
 
@@ -955,7 +1074,7 @@ Mining depends on inventory system:
 7. ~~**Ground-level targeting**~~ - DONE! Auto-detect ground Y at target X/Z coordinates
 8. ~~**Minimap integration**~~ - DONE! Bot appears on minimap/world map with custom cyan marker
 9. **Hostile creature targeting** - JSON patch to make creatures attack the bot
-10. **Inventory management** - Player-like inventory with pickup/drop/equip/use
+10. ~~**Inventory management**~~ - DONE! Manual pickup/drop with seraphinventory behavior
 11. **Hunger/satiety system** - Add hunger behavior, feeding endpoints
 12. **Crafting system** - Simulated grid crafting for basic recipes
 13. **Mining system** - Tool tier checks, mining time, proper drops
@@ -1217,4 +1336,4 @@ With lang entries:
 - **Reference:** See vanilla `trader-*.json` entities which have no spawnConditions and only spawn via structures.
 
 ---
-*Last updated: Session 10*
+*Last updated: Session 11 - Added inventory system with seraphinventory behavior, bot_pickup for item entities*

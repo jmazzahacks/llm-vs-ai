@@ -37,6 +37,9 @@
             },
             {
                 "code": "interpolateposition"
+            },
+            {
+                "code": "seraphinventory"
             }
         ],
         "animations": [
@@ -105,6 +108,9 @@
             {
                 "code": "floatupwhenstuck",
                 "onlyWhenDead": false
+            },
+            {
+                "code": "seraphinventory"
             },
             {
                 "code": "taskai",
