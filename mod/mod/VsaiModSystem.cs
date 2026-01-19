@@ -47,6 +47,10 @@ public class VsaiModSystem : ModSystem
         // Register our custom AI task
         AiTaskRegistry.Register<AiTaskRemoteControl>("vsai:remotecontrol");
         api.Logger.Notification("[VSAI] Registered AI task: vsai:remotecontrol");
+
+        // Register our custom entity class (prevents persistence to save file)
+        api.RegisterEntity("vsai.EntityAiBot", typeof(EntityAiBot));
+        api.Logger.Notification("[VSAI] Registered entity class: vsai.EntityAiBot");
     }
 
     public override void StartServerSide(ICoreServerAPI api)
@@ -480,21 +484,10 @@ public class VsaiModSystem : ModSystem
         {
             try
             {
-                // Clean up ALL existing aibot entities before spawning new one (alive or dead)
-                var allEntities = _serverApi.World.LoadedEntities.Values.ToList();
-                int cleanedUp = 0;
-                foreach (var entity in allEntities)
-                {
-                    if (entity.Code?.Path == "aibot")
-                    {
-                        entity.Die(EnumDespawnReason.Removed);
-                        cleanedUp++;
-                    }
-                }
-                if (cleanedUp > 0)
-                {
-                    _serverApi.Logger.Notification($"[VSAI] Cleaned up {cleanedUp} existing aibot entities before spawn");
-                }
+                // Log current entity count before spawn
+                int existingCount = _serverApi.World.LoadedEntities.Values.Count(e => e.Code?.Path == "aibot");
+                _serverApi.Logger.Notification($"[VSAI] Before spawn: {existingCount} aibot entities in LoadedEntities");
+
                 _botEntity = null;
                 _botEntityId = 0;
 
@@ -521,7 +514,10 @@ public class VsaiModSystem : ModSystem
                 _serverApi.World.SpawnEntity(_botEntity);
                 _botEntityId = _botEntity.EntityId;
 
-                _serverApi.Logger.Notification($"[VSAI] Bot spawned: {entityCode} at {spawnPos}");
+                // Log entity count after spawn
+                int afterCount = _serverApi.World.LoadedEntities.Values.Count(e => e.Code?.Path == "aibot");
+                _serverApi.Logger.Notification($"[VSAI] Bot spawned: {entityCode} at {spawnPos}, EntityId={_botEntityId}");
+                _serverApi.Logger.Notification($"[VSAI] After spawn: {afterCount} aibot entities in LoadedEntities");
                 success = true;
             }
             catch (Exception ex)
@@ -605,30 +601,34 @@ public class VsaiModSystem : ModSystem
 
     private string HandleBotCleanup()
     {
+        // Just despawn the tracked bot - don't iterate through all entities
+        // as that triggers chunk loading which resurrects old bots from save
+        if (_botEntity == null)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                message = "No tracked bot to clean up"
+            });
+        }
+
         var waitHandle = new ManualResetEventSlim(false);
-        int killedCount = 0;
         string? errorMsg = null;
+        long entityId = _botEntityId;
 
         _serverApi?.Event.EnqueueMainThreadTask(() =>
         {
             try
             {
-                // Find ALL aibot entities in the world (alive or dead)
-                var allEntities = _serverApi.World.LoadedEntities.Values.ToList();
-                foreach (var entity in allEntities)
+                if (_botEntity != null)
                 {
-                    if (entity.Code?.Path == "aibot")
-                    {
-                        entity.Die(EnumDespawnReason.Removed);
-                        killedCount++;
-                    }
+                    _botEntity.Die(EnumDespawnReason.Removed, null);
+                    _serverApi.World.DespawnEntity(_botEntity, new EntityDespawnData { Reason = EnumDespawnReason.Removed });
+                    _serverApi.Logger.Notification($"[VSAI] Despawned tracked bot entity {_botEntityId}");
                 }
 
-                // Clear our tracked bot reference
                 _botEntity = null;
                 _botEntityId = 0;
-
-                _serverApi.Logger.Notification($"[VSAI] Cleaned up {killedCount} aibot entities");
             }
             catch (Exception ex)
             {
@@ -650,7 +650,7 @@ public class VsaiModSystem : ModSystem
         return JsonSerializer.Serialize(new
         {
             success = true,
-            message = $"Cleaned up {killedCount} aibot entities"
+            message = $"Cleaned up tracked bot (ID: {entityId})"
         });
     }
 

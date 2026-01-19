@@ -1,6 +1,6 @@
 {
     "code": "aibot",
-    "class": "EntityAgent",
+    "class": "vsai.EntityAiBot",
     "hitboxSize": {
         "x": 0.6,
         "y": 1.75
@@ -117,15 +117,7 @@
                     }
                 ]
             }
-        ],
-        "spawnConditions": {
-            "worldgen": {
-                "group": "none"
-            },
-            "runtime": {
-                "group": "none"
-            }
-        }
+        ]
     },
     "sounds": {
         "hurt": "game:creature/humanoid-hurt",

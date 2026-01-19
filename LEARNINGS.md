@@ -1051,6 +1051,36 @@ Project references needed for minimap integration:
 
 The bot marker is a cyan (turquoise) circle with a white center dot, making it distinct from the white player marker.
 
+## Key Insights from Session 9
+
+1. **Preventing entity worldgen/runtime spawning:** To prevent an entity from spawning naturally during world generation or runtime, **DO NOT include a `spawnConditions` section at all** in the entity JSON. This is how vanilla traders work.
+
+   **WRONG - causes unwanted spawning:**
+   ```json
+   "spawnConditions": {
+       "worldgen": { "group": "none" },
+       "runtime": { "group": "none" }
+   }
+   ```
+   VS interprets `"group": "none"` as a literal group name, not a directive to disable spawning. This caused 20+ aibot entities to spawn during world generation!
+
+   **CORRECT - omit the section entirely:**
+   ```json
+   "server": {
+       "behaviors": [ ... ]
+       // NO spawnConditions section = no natural spawning
+   }
+   ```
+
+2. **EntityAiBot custom class:** Created `EntityAiBot` extending `EntityAgent` with `StoreWithChunk => false` to prevent persistence. However, this alone doesn't prevent worldgen spawning - must also omit spawnConditions.
+
+3. **Debugging entity spawning:** Check server logs for spawn counts:
+   ```
+   [VSAI] Before spawn: 0 aibot entities in LoadedEntities
+   [VSAI] After spawn: 1 aibot entities in LoadedEntities
+   ```
+   If "Before spawn" shows non-zero count in a new world, entities are spawning via worldgen.
+
 ## Key Insights from Session 8
 
 1. **Loose stones/flint block codes:** Flint and loose stones have specific naming:
@@ -1100,6 +1130,13 @@ VintageStory-AI/
 └── tools/                    # Python tools (git repo)
     └── bot_move.py           # CLI tool for movement testing
 ```
+
+## Common Errors & Solutions (continued)
+
+### Entity spawns naturally during worldgen when it shouldn't
+- **Cause:** Entity JSON has `spawnConditions` with invalid group like `"group": "none"`
+- **Solution:** Remove the entire `spawnConditions` section from the entity JSON. VS only spawns entities that have valid spawnConditions - omitting it entirely prevents all natural spawning.
+- **Reference:** See vanilla `trader-*.json` entities which have no spawnConditions and only spawn via structures.
 
 ---
 *Last updated: Session 9*

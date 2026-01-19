@@ -118,9 +118,34 @@ public class AiBotMapLayer : MapLayer
 
     public override void Render(GuiElementMap mapElem, float dt)
     {
-        // Render all tracked bot markers
+        // Find the ONE valid active bot to display (most recently spawned)
+        Entity? activeBot = null;
+        long highestEntityId = 0;
+
+        foreach (var entity in _capi.World.LoadedEntities.Values)
+        {
+            if (entity.Code?.Path == "aibot"
+                && entity.Alive
+                && entity.State == EnumEntityState.Active
+                && entity.EntityId > highestEntityId)
+            {
+                activeBot = entity;
+                highestEntityId = entity.EntityId;
+            }
+        }
+
+        // Clear all tracked components
         foreach (var component in _components.Values)
         {
+            component.Dispose();
+        }
+        _components.Clear();
+
+        // Only add the one active bot
+        if (activeBot != null && _botTexture != null)
+        {
+            var component = new EntityMapComponent(_capi, _botTexture, activeBot);
+            _components[activeBot.EntityId] = component;
             component.Render(mapElem, dt);
         }
     }
