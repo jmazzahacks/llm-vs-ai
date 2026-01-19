@@ -1131,6 +1131,84 @@ VintageStory-AI/
     └── bot_move.py           # CLI tool for movement testing
 ```
 
+## Entity Display Names (Localization)
+
+### How Entity Names Work
+
+When you look at an entity, VS looks up a translation key in lang files. For creatures, the key format is:
+```
+item-creature-{entity-code}
+```
+
+For our bot with code `"aibot"`, VS looks for `item-creature-aibot`.
+
+### Without Lang File
+If no translation exists, VS shows the raw lookup path with mod prefix:
+```
+vsai:item-creature-aibot
+```
+
+### Adding a Lang File
+
+Create `mod/assets/vsai/lang/en.json`:
+```json
+{
+    "item-creature-aibot": "Claude"
+}
+```
+
+**File location pattern:** `assets/{modid}/lang/{language-code}.json`
+
+### Language Codes
+VS supports 30+ languages. Common codes:
+- `en.json` - English
+- `de.json` - German
+- `fr.json` - French
+- `es.json` - Spanish
+- `ru.json` - Russian
+- `zh.json` - Chinese
+
+### Other Translation Key Patterns
+
+| Type | Key Pattern | Example |
+|------|-------------|---------|
+| Creatures | `item-creature-{code}` | `item-creature-aibot` |
+| Blocks | `block-{code}` | `block-dirt` |
+| Items | `item-{code}` | `item-stick` |
+| Named entities | `nametag-{name}` | `nametag-tobias` |
+| Unrevealed names | `nametag-{type}-unrevealedname` | `nametag-trader-unrevealedname` |
+
+### Nametag Behavior (Floating Names)
+
+For entities with floating name tags (like traders), add the `nametag` behavior:
+
+```json
+{
+    "client": {
+        "behaviors": [
+            { "code": "nametag" }
+        ]
+    },
+    "server": {
+        "behaviors": [
+            {
+                "code": "nametag",
+                "showtagonlywhentargeted": true,
+                "selectFromRandomName": ["Claude", "Opus", "Sonnet"]
+            }
+        ]
+    }
+}
+```
+
+With lang entries:
+```json
+{
+    "nametag-claude": "Claude",
+    "nametag-opus": "Opus"
+}
+```
+
 ## Common Errors & Solutions (continued)
 
 ### Entity spawns naturally during worldgen when it shouldn't
@@ -1139,4 +1217,4 @@ VintageStory-AI/
 - **Reference:** See vanilla `trader-*.json` entities which have no spawnConditions and only spawn via structures.
 
 ---
-*Last updated: Session 9*
+*Last updated: Session 10*
