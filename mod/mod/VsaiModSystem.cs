@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
@@ -36,7 +37,8 @@ public class VsaiModSystem : ModSystem
 
     public override bool ShouldLoad(EnumAppSide side)
     {
-        return side == EnumAppSide.Server;
+        // Load on both client (for minimap) and server (for HTTP API)
+        return true;
     }
 
     public override void Start(ICoreAPI api)
@@ -58,6 +60,23 @@ public class VsaiModSystem : ModSystem
         StartHttpServer();
 
         _serverApi.Logger.Notification($"[VSAI] HTTP server started on http://{DefaultHost}:{DefaultPort}");
+    }
+
+    public override void StartClientSide(ICoreClientAPI api)
+    {
+        api.Logger.Notification("[VSAI] Starting client-side for minimap integration...");
+
+        // Register the bot map layer with the world map
+        var mapManager = api.ModLoader.GetModSystem<WorldMapManager>();
+        if (mapManager != null)
+        {
+            mapManager.RegisterMapLayer<AiBotMapLayer>("vsai-bot", 0.5);
+            api.Logger.Notification("[VSAI] Registered AiBotMapLayer with WorldMapManager");
+        }
+        else
+        {
+            api.Logger.Warning("[VSAI] WorldMapManager not found, minimap integration disabled");
+        }
     }
 
     public override void Dispose()
@@ -461,14 +480,14 @@ public class VsaiModSystem : ModSystem
         {
             try
             {
-                // Clean up all existing aibot entities before spawning new one
+                // Clean up ALL existing aibot entities before spawning new one (alive or dead)
                 var allEntities = _serverApi.World.LoadedEntities.Values.ToList();
                 int cleanedUp = 0;
                 foreach (var entity in allEntities)
                 {
-                    if (entity.Code?.Path == "aibot" && entity.Alive)
+                    if (entity.Code?.Path == "aibot")
                     {
-                        entity.Die();
+                        entity.Die(EnumDespawnReason.Removed);
                         cleanedUp++;
                     }
                 }
@@ -594,13 +613,13 @@ public class VsaiModSystem : ModSystem
         {
             try
             {
-                // Find all aibot entities in the world
+                // Find ALL aibot entities in the world (alive or dead)
                 var allEntities = _serverApi.World.LoadedEntities.Values.ToList();
                 foreach (var entity in allEntities)
                 {
-                    if (entity.Code?.Path == "aibot" && entity.Alive)
+                    if (entity.Code?.Path == "aibot")
                     {
-                        entity.Die();
+                        entity.Die(EnumDespawnReason.Removed);
                         killedCount++;
                     }
                 }

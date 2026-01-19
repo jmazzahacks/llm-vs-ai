@@ -953,12 +953,13 @@ Mining depends on inventory system:
 5. ~~**Python CLI tool**~~ - DONE! `tools/bot_move.py` demonstrates MCP pattern
 6. ~~**MCP Server**~~ - DONE! Python MCP server with visibility filtering
 7. ~~**Ground-level targeting**~~ - DONE! Auto-detect ground Y at target X/Z coordinates
-8. **Hostile creature targeting** - JSON patch to make creatures attack the bot
-9. **Inventory management** - Player-like inventory with pickup/drop/equip/use
-10. **Hunger/satiety system** - Add hunger behavior, feeding endpoints
-11. **Crafting system** - Simulated grid crafting for basic recipes
-12. **Mining system** - Tool tier checks, mining time, proper drops
-13. **Combat** - Attack entities, defend
+8. ~~**Minimap integration**~~ - DONE! Bot appears on minimap/world map with custom cyan marker
+9. **Hostile creature targeting** - JSON patch to make creatures attack the bot
+10. **Inventory management** - Player-like inventory with pickup/drop/equip/use
+11. **Hunger/satiety system** - Add hunger behavior, feeding endpoints
+12. **Crafting system** - Simulated grid crafting for basic recipes
+13. **Mining system** - Tool tier checks, mining time, proper drops
+14. **Combat** - Attack entities, defend
 
 ## Key Insights from Session 6
 
@@ -985,6 +986,70 @@ Mining depends on inventory system:
 5. **Bot health:** Bot has 20 HP (like player), takes fall damage, has hurt/death sounds configured.
 
 6. **Hostile targeting:** Hostile creatures (drifters, wolves) do NOT attack the bot by default - they only target `"player"` entity code. Can be changed via JSON patch to add `"aibot"` to their `entityCodes` target list.
+
+## Minimap Integration - WORKING!
+
+### How It Works
+
+The bot now appears on the minimap (F6) and world map (M) as a cyan marker.
+
+**Key Components:**
+1. `AiBotMapLayer` - Custom `MapLayer` subclass that tracks aibot entities
+2. `EntityMapComponent` - VS class that handles rendering entity markers
+3. Cairo texture generation - Creates the cyan circular marker
+
+### Implementation Details
+
+**Mod loads on both sides:**
+```csharp
+public override bool ShouldLoad(EnumAppSide side)
+{
+    return true;  // Load on both client and server
+}
+```
+
+**Register map layer in StartClientSide:**
+```csharp
+public override void StartClientSide(ICoreClientAPI api)
+{
+    var mapManager = api.ModLoader.GetModSystem<WorldMapManager>();
+    mapManager.RegisterMapLayer<AiBotMapLayer>("vsai-bot", 0.5);
+}
+```
+
+**Track only aibot entities:**
+```csharp
+private void OnEntitySpawn(Entity entity)
+{
+    if (entity.Code?.Path != "aibot") return;
+    var component = new EntityMapComponent(_capi, _botTexture, entity);
+    _components[entity.EntityId] = component;
+}
+```
+
+### Required References
+
+Project references needed for minimap integration:
+```xml
+<Reference Include="VintagestoryLib">
+  <HintPath>$(VINTAGE_STORY)/VintagestoryLib.dll</HintPath>
+</Reference>
+<Reference Include="cairo-sharp">
+  <HintPath>$(VINTAGE_STORY)/Lib/cairo-sharp.dll</HintPath>
+</Reference>
+```
+
+### MapLayer Properties
+
+| Property | Value | Description |
+|----------|-------|-------------|
+| `Title` | "AI Bot" | Layer name in UI |
+| `DataSide` | `EnumMapAppSide.Client` | Data is client-side |
+| `LayerGroupCode` | "entities" | Groups with other entity layers |
+
+### Marker Appearance
+
+The bot marker is a cyan (turquoise) circle with a white center dot, making it distinct from the white player marker.
 
 ## Key Insights from Session 8
 
@@ -1015,7 +1080,12 @@ VintageStory-AI/
 ├── CLAUDE.md                 # Claude Code instructions
 ├── .mcp.json                 # MCP server config for Claude Code
 ├── mod/                      # C# Vintage Story mod (git repo)
-│   └── ...
+│   ├── mod.csproj            # References VintagestoryAPI, VintagestoryLib, cairo-sharp, VSEssentials
+│   ├── modinfo.json
+│   ├── VsaiModSystem.cs      # Main mod (server HTTP API + client minimap)
+│   ├── AiTaskRemoteControl.cs  # Custom AI task for bot movement
+│   ├── AiBotMapLayer.cs      # Minimap integration (client-side)
+│   └── assets/vsai/          # Entity definition, shapes, textures
 ├── mcp-server/               # Python MCP server (git repo)
 │   ├── vsai_server.py        # MCP server with 13 tools
 │   ├── requirements.txt      # mcp>=1.0.0
@@ -1032,4 +1102,4 @@ VintageStory-AI/
 ```
 
 ---
-*Last updated: Session 8*
+*Last updated: Session 9*
