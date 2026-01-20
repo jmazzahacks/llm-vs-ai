@@ -1,4 +1,5 @@
 using Vintagestory.API.Common;
+using Vintagestory.API.Common.Entities;
 
 namespace vsai;
 
@@ -13,4 +14,32 @@ public class EntityAiBot : EntityAgent
     /// This ensures orphaned bots don't accumulate across game sessions.
     /// </summary>
     public override bool StoreWithChunk => false;
+
+    /// <summary>
+    /// Keep bot active regardless of distance from players.
+    /// This prevents the bot from becoming inactive or despawning
+    /// when it travels far from the player during autonomous tasks.
+    /// </summary>
+    public override bool AlwaysActive => true;
+
+    /// <summary>
+    /// Prevent the bot from being despawned during chunk unload.
+    /// Without this, the entity gets removed from LoadedEntities when
+    /// its chunk unloads, even with AlwaysActive=true.
+    /// This matches how EntityPlayer prevents despawning.
+    /// </summary>
+    public override bool ShouldDespawn => false;
+
+    /// <summary>
+    /// Initialize the entity with extended simulation range.
+    /// Default SimulationRange is 128 blocks - we extend to 1000 to allow
+    /// the bot to move autonomously at greater distances from the player.
+    /// </summary>
+    public override void Initialize(EntityProperties properties, ICoreAPI api, long InChunkIndex3d)
+    {
+        base.Initialize(properties, api, InChunkIndex3d);
+
+        // Extend simulation range from default 128 to 1000 blocks
+        SimulationRange = 1000;
+    }
 }

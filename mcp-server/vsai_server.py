@@ -95,6 +95,41 @@ def wait_for_movement_complete() -> dict[str, Any]:
         time.sleep(MOVEMENT_POLL_INTERVAL_SEC)
 
 
+def wait_for_direct_walk_complete() -> dict[str, Any]:
+    """
+    Poll movement status until the bot finishes direct walking.
+    Direct walking is simpler than pathfinding - just checks isDirectWalking flag.
+    Returns the final movement status.
+    """
+    terminal_states = {"idle", "reached", "stuck", "no_task"}
+    start_time = time.time()
+
+    while True:
+        if time.time() - start_time > MOVEMENT_TIMEOUT_SEC:
+            return {"error": "Movement timeout", "status": "timeout"}
+
+        try:
+            status = http_get("/bot/movement/status")
+        except URLError as e:
+            return {"error": f"Failed to get status: {e}", "status": "error"}
+
+        if "error" in status:
+            return status
+
+        current_status = status.get("status", "unknown")
+        is_direct_walking = status.get("isDirectWalking", False)
+
+        # Check if direct walking has completed
+        if not is_direct_walking and current_status in terminal_states:
+            # Confirm by waiting one more poll
+            time.sleep(MOVEMENT_POLL_INTERVAL_SEC)
+            confirm = http_get("/bot/movement/status")
+            if not confirm.get("isDirectWalking", False):
+                return confirm
+
+        time.sleep(MOVEMENT_POLL_INTERVAL_SEC)
+
+
 # Create MCP server
 server = Server("vsai")
 
@@ -151,6 +186,21 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "x": {"type": "number", "description": "Target X coordinate"},
                     "y": {"type": "number", "description": "Target Y coordinate (must be at ground level)"},
+                    "z": {"type": "number", "description": "Target Z coordinate"},
+                    "speed": {"type": "number", "description": "Movement speed (default: 0.03)", "default": 0.03},
+                    "relative": {"type": "boolean", "description": "If true, coordinates are relative to current position", "default": False}
+                },
+                "required": ["x", "y", "z"]
+            }
+        ),
+        Tool(
+            name="bot_walk",
+            description="Command the bot to walk directly to a position (bypasses A* pathfinding). Use this when pathfinding fails, especially for long distances beyond chunk loading range (~128 blocks). Bot walks in a straight line - will not avoid obstacles. Blocks until the bot reaches the destination.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "Target X coordinate"},
+                    "y": {"type": "number", "description": "Target Y coordinate"},
                     "z": {"type": "number", "description": "Target Z coordinate"},
                     "speed": {"type": "number", "description": "Movement speed (default: 0.03)", "default": 0.03},
                     "relative": {"type": "boolean", "description": "If true, coordinates are relative to current position", "default": False}
@@ -317,11 +367,19 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+# Tools that have blocking wait loops and need to run in a thread
+BLOCKING_TOOLS = {"bot_goto", "bot_walk"}
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle tool calls."""
     try:
-        result = execute_tool(name, arguments)
+        # Run blocking tools in a background thread so MCP server stays responsive
+        if name in BLOCKING_TOOLS:
+            result = await asyncio.to_thread(execute_tool, name, arguments)
+        else:
+            result = execute_tool(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
     except URLError as e:
         error_result = {"error": f"Failed to connect to VS server: {e}"}
@@ -406,6 +464,65 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "endPosition": {"x": end_pos.x, "y": end_pos.y, "z": end_pos.z},
             "targetPosition": {"x": target.x, "y": target.y, "z": target.z},
             "distanceToTarget": end_pos.distance_to(target)
+        }
+
+    elif name == "bot_walk":
+        # Get initial position for reporting
+        initial_status = http_get("/bot/movement/status")
+        if "error" in initial_status:
+            return initial_status
+
+        start_pos = Position(
+            initial_status["position"]["x"],
+            initial_status["position"]["y"],
+            initial_status["position"]["z"]
+        )
+
+        # Issue walk command (direct movement, bypasses pathfinding)
+        walk_result = http_post("/bot/walk", {
+            "x": arguments["x"],
+            "y": arguments["y"],
+            "z": arguments["z"],
+            "speed": arguments.get("speed", 0.03),
+            "relative": arguments.get("relative", False)
+        })
+
+        if "error" in walk_result:
+            return walk_result
+
+        # Calculate actual target
+        if arguments.get("relative", False):
+            target = Position(
+                start_pos.x + arguments["x"],
+                start_pos.y + arguments["y"],
+                start_pos.z + arguments["z"]
+            )
+        else:
+            target = Position(arguments["x"], arguments["y"], arguments["z"])
+
+        # Wait for direct walking to complete
+        final_status = wait_for_direct_walk_complete()
+
+        if "error" in final_status:
+            return final_status
+
+        end_pos = Position(
+            final_status["position"]["x"],
+            final_status["position"]["y"],
+            final_status["position"]["z"]
+        )
+
+        success = final_status.get("status") == "reached"
+
+        return {
+            "success": success,
+            "status": final_status.get("status"),
+            "statusMessage": final_status.get("statusMessage"),
+            "startPosition": {"x": start_pos.x, "y": start_pos.y, "z": start_pos.z},
+            "endPosition": {"x": end_pos.x, "y": end_pos.y, "z": end_pos.z},
+            "targetPosition": {"x": target.x, "y": target.y, "z": target.z},
+            "distanceToTarget": end_pos.distance_to(target),
+            "note": "Used direct walk (bypassed A* pathfinding)"
         }
 
     elif name == "bot_stop":

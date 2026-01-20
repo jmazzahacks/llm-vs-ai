@@ -173,9 +173,59 @@ AiTaskRegistry.Register<AiTaskRemoteControl>("vsai:remotecontrol");
 - Bot can navigate around obstacles, climb hills, handle terrain changes
 - Native VS movement = proper animations, physics, collision
 
-**WalkTowards vs NavigateTo:**
+**WalkTowards vs NavigateTo vs Direct Walk:**
 - `WalkTowards(target, ...)` - walks in a STRAIGHT LINE toward target, no pathfinding
 - `NavigateTo(target, ...)` - runs A* pathfinding, follows waypoints around obstacles
+- **Direct Walk** - sets motion vectors directly, bypasses both PathTraverser and pathfinding
+
+### Direct Walk (Motion Vector Approach)
+
+When A* pathfinding fails due to unloaded chunks (beyond ~128 blocks from player), use direct walking:
+
+```csharp
+// In AiTaskRemoteControl
+private Vec3d? _directWalkTarget;
+private float _directWalkSpeed = 0.06f;
+
+public override bool ContinueExecute(float dt)
+{
+    if (_directWalkTarget != null)
+    {
+        var currentPos = entity.ServerPos.XYZ;
+        double dx = _directWalkTarget.X - currentPos.X;
+        double dz = _directWalkTarget.Z - currentPos.Z;
+        double dist = Math.Sqrt(dx * dx + dz * dz);
+
+        if (dist < 1.0)  // Arrival threshold
+        {
+            _directWalkTarget = null;
+            entity.ServerPos.Motion.Set(0, entity.ServerPos.Motion.Y, 0);
+            _status = "reached";
+        }
+        else
+        {
+            // Normalize and set motion
+            entity.ServerPos.Motion.X = (dx / dist) * _directWalkSpeed;
+            entity.ServerPos.Motion.Z = (dz / dist) * _directWalkSpeed;
+
+            // Face direction of travel
+            entity.ServerPos.Yaw = (float)Math.Atan2(-dx, dz);
+        }
+    }
+    return true;
+}
+```
+
+**Key differences from PathTraverser:**
+- Sets `entity.ServerPos.Motion.X/Z` directly (horizontal only)
+- Preserves `Motion.Y` for gravity
+- No path calculation - walks in straight line
+- Works even with unloaded chunks (no A* needed)
+- **Will NOT avoid obstacles** - use only in open terrain or as fallback
+
+**API Endpoint:** `/bot/walk` with same params as `/bot/goto`
+
+**MCP Tool:** `bot_walk` - blocks until destination reached (polls isDirectWalking)
 
 ### Approach 1: Setting Controls (EntityControls) - DOESN'T WORK
 ```csharp
@@ -360,7 +410,7 @@ The target Y must be at actual ground level (where the bot can stand). If target
 | `/bot/entities?radius=N` | GET | Entities around bot |
 | `/bot/move` | POST | Teleport bot to position |
 | `/bot/goto` | POST | Walk to position (uses NavigateTo pathfinding) |
-| `/bot/walk` | POST | Set movement controls |
+| `/bot/walk` | POST | Direct walk to position (bypasses A* pathfinding) |
 | `/bot/stop` | POST | Stop movement |
 | `/bot/break` | POST | Break block at position |
 | `/bot/place` | POST | Place block at position |
@@ -1191,7 +1241,23 @@ The bot marker is a cyan (turquoise) circle with a white center dot, making it d
    }
    ```
 
-2. **EntityAiBot custom class:** Created `EntityAiBot` extending `EntityAgent` with `StoreWithChunk => false` to prevent persistence. However, this alone doesn't prevent worldgen spawning - must also omit spawnConditions.
+2. **EntityAiBot custom class:** Created `EntityAiBot` extending `EntityAgent` with special overrides:
+   - `StoreWithChunk => false` - Prevents persistence to save file (no orphan bots)
+   - `AlwaysActive => true` - **CRITICAL**: Keeps bot active regardless of distance from players
+
+   **Why AlwaysActive matters:** Without this, when the bot travels far from the player, VS will despawn the entity when its chunk unloads. Since `StoreWithChunk => false`, the entity won't be saved, causing a "ghost bot" situation where the server holds a stale reference but the entity no longer exists in the world. The bot becomes invisible and unresponsive. `AlwaysActive` prevents this by keeping the entity simulating regardless of player distance.
+
+   Note: This alone doesn't prevent worldgen spawning - must also omit spawnConditions from entity JSON.
+
+   **Distance limitations with AlwaysActive:**
+   - Bot stays alive and registered (`inLoadedEntities: true`, `state: "Active"`) at any distance
+   - Bot can chat and scan blocks at any distance (chunk data accessible via server)
+   - Minimap visibility limited to ~128 blocks (client chunk loading)
+   - When player returns within range, bot can move again immediately
+
+   **IMPORTANT:** `AlwaysActive` alone is NOT sufficient for long-distance movement. See "Entity Simulation Range" section below for the complete solution.
+
+   **Direct Walk (`/bot/walk`):** Bypasses A* pathfinding but still requires entity simulation. Useful when pathfinding fails due to terrain complexity.
 
 3. **Debugging entity spawning:** Check server logs for spawn counts:
    ```
@@ -1328,6 +1394,85 @@ With lang entries:
 }
 ```
 
+## Entity Simulation Range - CRITICAL FOR LONG-DISTANCE BOT MOVEMENT
+
+### The Problem
+
+By default, entity physics (movement, pathfinding, AI) only runs when the entity is within ~128 blocks of any player. Beyond this range, the entity's `State` becomes `EnumEntityState.Inactive` and the `BehaviorControlledPhysics.OnPhysicsTick()` method returns early without processing movement.
+
+**Symptoms of being out of simulation range:**
+- Bot appears "frozen" - cannot move in any direction
+- `bot_goto` and `bot_walk` commands return immediately with no movement
+- Block scanning still works (chunk data accessible server-side)
+- Chat still works
+- Bot is still alive and registered in LoadedEntities
+
+### The Solution
+
+The `SimulationRange` property on `Entity` controls this distance threshold. Default is ~128 blocks (4 chunks × 32 blocks). We extended it to 1000 blocks in our custom `EntityAiBot` class.
+
+**Implementation in EntityAiBot.cs:**
+```csharp
+public class EntityAiBot : EntityAgent
+{
+    public override bool StoreWithChunk => false;  // Don't persist
+    public override bool AlwaysActive => true;     // Stay active regardless of distance
+    public override bool ShouldDespawn => false;   // Prevent removal from LoadedEntities
+
+    public override void Initialize(EntityProperties properties, ICoreAPI api, long InChunkIndex3d)
+    {
+        base.Initialize(properties, api, InChunkIndex3d);
+
+        // Extend simulation range from default 128 to 1000 blocks
+        SimulationRange = 1000;
+    }
+}
+```
+
+**The Three Properties for Long-Distance Bot Movement:**
+
+| Property | Purpose | Without It |
+|----------|---------|------------|
+| `AlwaysActive => true` | Keeps entity ticking regardless of player distance | Entity stops simulating when far from player |
+| `SimulationRange = 1000` | Extends physics simulation range to 1000 blocks | Physics (movement) stops at ~128 blocks |
+| `ShouldDespawn => false` | **CRITICAL** Prevents entity removal during chunk unload | Entity removed from LoadedEntities at ~325 blocks |
+
+**Why ShouldDespawn matters:**
+- `AlwaysActive` keeps the entity ticking but doesn't prevent removal from the `LoadedEntities` collection
+- When the bot's chunk unloads (player moves away), VS checks `ShouldDespawn`
+- Default implementation returns `!Alive` (false if alive), but chunk unload logic has additional checks
+- `EntityPlayer` overrides this to `=> false` explicitly - we must do the same
+- Without this override, bot was consistently despawning at ~325 blocks from the player
+- Discovery came from studying the VS API source at https://github.com/anegostudios/vsapi
+
+**Key points:**
+- `SimulationRange` is a public field, not a virtual property - set it in `Initialize()`, not as an override
+- Must call `base.Initialize()` first, then set the value
+- `AlwaysActive` is still needed to keep entity ticking
+- Both properties work together: `AlwaysActive` keeps entity loaded, `SimulationRange` controls physics range
+
+### VS Source Code References
+
+The physics tick check is in `BehaviorControlledPhysics.OnPhysicsTick()`:
+```csharp
+if (entity.State != EnumEntityState.Active) return;
+```
+
+Entity state is set based on player proximity in `EntityAgent.DoInitialActiveCheck()` and updated each tick based on `SimulationRange`.
+
+### Testing Results
+
+With `SimulationRange = 1000`:
+- Successfully tested bot movement to 190+ blocks from player
+- A* pathfinding (`bot_goto`) fails beyond ~128 blocks due to unloaded chunks
+- Direct walking (`bot_walk`) works at extended range since it doesn't require pathfinding
+- Bot can navigate autonomously at much greater distances
+
+### Related GitHub Issues
+
+- [VS Issue #5875](https://github.com/anegostudios/VintageStory-Issues/issues/5875) - Discusses entity simulation limits
+- VS API source: https://github.com/anegostudios/vsapi
+
 ## Common Errors & Solutions (continued)
 
 ### Entity spawns naturally during worldgen when it shouldn't
@@ -1336,4 +1481,4 @@ With lang entries:
 - **Reference:** See vanilla `trader-*.json` entities which have no spawnConditions and only spawn via structures.
 
 ---
-*Last updated: Session 11 - Added inventory system with seraphinventory behavior, bot_pickup for item entities*
+*Last updated: Session 14 - Added ShouldDespawn => false to prevent entity removal from LoadedEntities at ~325 blocks. Combined with AlwaysActive and SimulationRange, this completes the three-property solution for long-distance bot movement.*

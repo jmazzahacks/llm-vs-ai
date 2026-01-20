@@ -263,6 +263,18 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/walk":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotWalk(request);
+                    }
+                    break;
+
                 case "/bot/movement/status":
                     responseBody = HandleBotMovementStatus();
                     break;
@@ -703,6 +715,10 @@ public class VsaiModSystem : ModSystem
 
         var pos = _botEntity.ServerPos;
 
+        // Diagnostic: check if entity is actually in the world's LoadedEntities
+        bool inLoadedEntities = _serverApi?.World.LoadedEntities.ContainsKey(_botEntityId) ?? false;
+        string? entityState = _botEntity.State.ToString();
+
         return JsonSerializer.Serialize(new
         {
             bot = new
@@ -712,7 +728,9 @@ public class VsaiModSystem : ModSystem
                 rotation = new { yaw = pos.Yaw, pitch = pos.Pitch },
                 alive = _botEntity.Alive,
                 onGround = _botEntity.OnGround,
-                inWater = _botEntity.Swimming
+                inWater = _botEntity.Swimming,
+                inLoadedEntities = inLoadedEntities,
+                state = entityState
             }
         });
     }
@@ -1058,11 +1076,12 @@ public class VsaiModSystem : ModSystem
 
         _serverApi?.Event.EnqueueMainThreadTask(() =>
         {
-            // Stop the AI task
+            // Stop the AI task (both pathfinding and direct walking)
             var task = GetRemoteControlTask();
             if (task != null)
             {
                 task.Stop();
+                task.StopDirectWalk();
                 status = task.GetStatus();
             }
             waitHandle.Set();
@@ -1210,6 +1229,119 @@ public class VsaiModSystem : ModSystem
         });
     }
 
+    /// <summary>
+    /// Direct walk to a target position (bypasses A* pathfinding).
+    /// Useful when pathfinding fails due to unloaded chunks.
+    /// </summary>
+    private string HandleBotWalk(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide x, y, z target coordinates.");
+        }
+
+        double targetX, targetY, targetZ;
+        float speed = 0.03f;  // Default direct walk speed (matches normal walk speed)
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("relative", out var relative) && relative.GetBoolean())
+            {
+                double dx = root.TryGetProperty("x", out var dxEl) ? dxEl.GetDouble() : 0;
+                double dy = root.TryGetProperty("y", out var dyEl) ? dyEl.GetDouble() : 0;
+                double dz = root.TryGetProperty("z", out var dzEl) ? dzEl.GetDouble() : 0;
+
+                targetX = _botEntity.ServerPos.X + dx;
+                targetY = _botEntity.ServerPos.Y + dy;
+                targetZ = _botEntity.ServerPos.Z + dz;
+            }
+            else
+            {
+                if (!root.TryGetProperty("x", out var xEl) ||
+                    !root.TryGetProperty("y", out var yEl) ||
+                    !root.TryGetProperty("z", out var zEl))
+                {
+                    return JsonError("Missing x, y, or z coordinates");
+                }
+
+                targetX = xEl.GetDouble();
+                targetY = yEl.GetDouble();
+                targetZ = zEl.GetDouble();
+            }
+
+            if (root.TryGetProperty("speed", out var speedEl))
+            {
+                speed = (float)speedEl.GetDouble();
+            }
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+
+        // Use the AI task for direct walking
+        string? errorMsg = null;
+        var waitHandle = new ManualResetEventSlim(false);
+
+        _serverApi?.Event.EnqueueMainThreadTask(() =>
+        {
+            try
+            {
+                var task = GetRemoteControlTask();
+                if (task == null)
+                {
+                    errorMsg = "RemoteControl AI task not found on entity";
+                }
+                else
+                {
+                    var targetPos = new Vec3d(targetX, targetY, targetZ);
+                    task.SetDirectWalkTarget(targetPos, speed);
+                    _serverApi.Logger.Notification($"[VSAI] Direct walk to ({targetX:F1}, {targetY:F1}, {targetZ:F1}), speed={speed}");
+                }
+            }
+            catch (Exception ex)
+            {
+                errorMsg = $"Error: {ex.Message}";
+            }
+            finally
+            {
+                waitHandle.Set();
+            }
+        }, "VSAI-WalkTask");
+
+        waitHandle.Wait(TimeSpan.FromSeconds(5));
+
+        if (errorMsg != null)
+        {
+            return JsonError(errorMsg);
+        }
+
+        var currentPos = _botEntity.ServerPos;
+        double distance = Math.Sqrt(
+            Math.Pow(targetX - currentPos.X, 2) +
+            Math.Pow(targetZ - currentPos.Z, 2)
+        );
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            target = new { x = targetX, y = targetY, z = targetZ },
+            currentPosition = new { x = currentPos.X, y = currentPos.Y, z = currentPos.Z },
+            distance = Math.Round(distance, 1),
+            speed = speed,
+            note = "Direct walk bypasses A* pathfinding. Bot will walk in a straight line."
+        });
+    }
+
     private string HandleBotMovementStatus()
     {
         if (_botEntity == null || !_botEntity.Alive)
@@ -1242,6 +1374,7 @@ public class VsaiModSystem : ModSystem
             position = new { x = pos.X, y = pos.Y, z = pos.Z },
             target = lastTarget != null ? new { x = lastTarget.X, y = lastTarget.Y, z = lastTarget.Z } : null,
             isActive = task.IsActive(),
+            isDirectWalking = task.IsDirectWalking(),
             onGround = _botEntity.OnGround
         });
     }
