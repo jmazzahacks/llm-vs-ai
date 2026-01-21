@@ -204,22 +204,21 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
-        # TEMPORARILY DISABLED - testing pathfinding without bot_goto
-        # Tool(
-        #     name="bot_goto",
-        #     description="Command the bot to walk to a position using A* pathfinding. Blocks until the bot reaches the destination or gets stuck. The target Y coordinate must be at actual ground level.",
-        #     inputSchema={
-        #         "type": "object",
-        #         "properties": {
-        #             "x": {"type": "number", "description": "Target X coordinate"},
-        #             "y": {"type": "number", "description": "Target Y coordinate (must be at ground level)"},
-        #             "z": {"type": "number", "description": "Target Z coordinate"},
-        #             "speed": {"type": "number", "description": "Movement speed (default: 0.03)", "default": 0.03},
-        #             "relative": {"type": "boolean", "description": "If true, coordinates are relative to current position", "default": False}
-        #         },
-        #         "required": ["x", "y", "z"]
-        #     }
-        # ),
+        Tool(
+            name="bot_goto",
+            description="Command the bot to walk to a position using the game's built-in A* pathfinding (NavigateTo). Blocks until the bot reaches the destination or gets stuck. Works at long distances now that chunk loading is fixed. For complex terrain or when this fails, use bot_pathfind + bot_walk instead.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "Target X coordinate"},
+                    "y": {"type": "number", "description": "Target Y coordinate (must be at ground level)"},
+                    "z": {"type": "number", "description": "Target Z coordinate"},
+                    "speed": {"type": "number", "description": "Movement speed (default: 0.03)", "default": 0.03},
+                    "relative": {"type": "boolean", "description": "If true, coordinates are relative to current position", "default": False}
+                },
+                "required": ["x", "y", "z"]
+            }
+        ),
         Tool(
             name="bot_walk",
             description="Command the bot to walk directly to a position (bypasses A* pathfinding). Use this when pathfinding fails, especially for long distances beyond chunk loading range (~128 blocks). Bot walks in a straight line - will not avoid obstacles. Blocks until the bot reaches the destination.",

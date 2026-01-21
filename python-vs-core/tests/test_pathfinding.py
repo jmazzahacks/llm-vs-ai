@@ -127,14 +127,38 @@ class TestStepDown:
         assert result["reached_target"] is True
 
     def test_step_down_two_blocks_fallback(self) -> None:
-        """Bot uses 2-block drop as fallback when necessary."""
-        # Create terrain where only path is 2-block drop
+        """Bot uses 2-block drop as fallback when there's an escape route."""
+        # Create terrain where path requires a 2-block drop but has an escape
         blocks = []
-        # Start area
+        # Start area at y=100
         for x in range(-2, 3):
             for z in range(-2, 3):
                 blocks.append(make_block(x, 100, z))
-        # Target area (2 blocks lower)
+        # Target area (2 blocks lower) at y=98
+        for x in range(3, 8):
+            for z in range(-2, 3):
+                blocks.append(make_block(x, 98, z))
+        # Add escape route: step up at far end (y=99 at x=8)
+        for z in range(-2, 3):
+            blocks.append(make_block(8, 99, z))
+
+        current = {"x": 0.5, "y": 101.0, "z": 0.5}
+        target = {"x": 5.5, "y": 99.0, "z": 0.5}
+
+        result = find_safe_path(current, target, blocks)
+
+        assert result["success"] is True
+        assert result["reached_target"] is True
+
+    def test_no_drop_into_dead_end(self) -> None:
+        """Bot should NOT drop 2 blocks into an area with no escape."""
+        # Create terrain where only path is 2-block drop into dead end
+        blocks = []
+        # Start area at y=100
+        for x in range(-2, 3):
+            for z in range(-2, 3):
+                blocks.append(make_block(x, 100, z))
+        # Target area (2 blocks lower) with NO escape route
         for x in range(3, 8):
             for z in range(-2, 3):
                 blocks.append(make_block(x, 98, z))
@@ -144,6 +168,71 @@ class TestStepDown:
 
         result = find_safe_path(current, target, blocks)
 
+        # Should fail because there's no escape from the lower area
+        assert result["success"] is False
+
+
+class TestTrapAvoidance:
+    """Tests for avoiding traps (pits with no escape)."""
+
+    def test_avoid_pit_with_no_exit(self) -> None:
+        """Bot should NOT drop into a pit that has no reversible exit."""
+        # Create terrain: flat area, then a 2-block deep pit with no way out
+        blocks = []
+        # Start area at y=100
+        for x in range(-2, 3):
+            for z in range(-2, 3):
+                blocks.append(make_block(x, 100, z))
+
+        # Pit at x=3-5, 2 blocks lower (y=98), surrounded by walls
+        # This pit has NO reversible exit - all adjacent terrain is 2+ blocks higher
+        for x in range(3, 6):
+            for z in range(-1, 2):
+                blocks.append(make_block(x, 98, z))
+
+        # Walls around the pit (making it a true trap)
+        # Left wall (x=2) - already have y=100 blocks there
+        # Right wall (x=6)
+        for z in range(-1, 2):
+            blocks.append(make_block(6, 100, z))
+        # Front/back walls (z=-2 and z=2)
+        for x in range(3, 6):
+            blocks.append(make_block(x, 100, -2))
+            blocks.append(make_block(x, 100, 2))
+
+        # Target is across the pit (would require going through)
+        current = {"x": 0.5, "y": 101.0, "z": 0.5}
+        target = {"x": 4.5, "y": 99.0, "z": 0.5}
+
+        result = find_safe_path(current, target, blocks)
+
+        # Should NOT find a path because the only route is into a trap
+        assert result["success"] is False
+
+    def test_allow_drop_with_exit(self) -> None:
+        """Bot CAN drop 2 blocks if the destination has a reversible exit."""
+        # Create terrain: flat area, then a 2-block drop to another flat area
+        blocks = []
+        # Start area at y=100
+        for x in range(-2, 3):
+            for z in range(-2, 3):
+                blocks.append(make_block(x, 100, z))
+
+        # Lower area at y=98 with a 1-block step back up at the far end
+        for x in range(3, 8):
+            for z in range(-2, 3):
+                blocks.append(make_block(x, 98, z))
+
+        # Add a ramp back up (1-block step at x=7 to y=99)
+        for z in range(-2, 3):
+            blocks.append(make_block(8, 99, z))
+
+        current = {"x": 0.5, "y": 101.0, "z": 0.5}
+        target = {"x": 5.5, "y": 99.0, "z": 0.5}
+
+        result = find_safe_path(current, target, blocks)
+
+        # Should succeed because the lower area has an exit (can step up to y=99)
         assert result["success"] is True
         assert result["reached_target"] is True
 

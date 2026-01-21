@@ -213,14 +213,24 @@ def _has_body_clearance(
         # Check adjacent positions for body/head clearance
         # Bot's collision box extends ~0.3-0.5 blocks into adjacent cells,
         # so we must check if adjacent cells have solid blocks at body/head level.
-        # This catches narrow passages next to cliffs where the adjacent cliff
-        # blocks the bot even though the destination cell itself is clear.
+        # This catches narrow passages where adjacent walls block movement.
+        #
+        # IMPORTANT: Only check when adjacent terrain is at SIMILAR height.
+        # If adjacent surface is significantly higher (a wall/cliff going up),
+        # solid blocks at body level are part of the wall - not an obstruction.
+        # The bot can stand next to walls just fine.
         for dx, dz in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             adj_x, adj_z = x + dx, z + dz
             adj_key = (adj_x, adj_z)
 
             # Get the adjacent position's ground level (if known)
             adj_surface = heightmap.get(adj_key)
+
+            # Skip adjacent check if adjacent terrain is a wall/cliff going up.
+            # A wall is when adjacent surface is more than 1 block above current.
+            # Solid blocks at body/head level in that case are part of the wall.
+            if adj_surface is not None and adj_surface > surface_y + 1:
+                continue
 
             # Check body level - but skip if body_y is exactly at the adjacent's
             # surface level (that's just normal ground, not an obstruction).
@@ -287,9 +297,11 @@ def _get_walkable_neighbors(
         if height_diff < -1:
             if not allow_2_block_drop or height_diff < -2:
                 continue
-            # Check if it's a hole (gap with depth)
-            # For a 1-wide gap: we can cross if there's ground at ny
-            # But a 2+ deep hole at our level is dangerous
+            # This is a 2-block drop (non-reversible move).
+            # Before allowing it, verify the bot can escape from the landing position.
+            # This does a limited BFS to check if higher ground is reachable.
+            if not _can_escape_pit(nx, nz, ny, heightmap, solid_blocks, liquid_blocks):
+                continue
 
         # Check for body clearance at destination (both feet/body and head)
         # Pass heightmap to enable adjacent block checking for wider collision
@@ -311,6 +323,80 @@ def _get_walkable_neighbors(
         neighbors.append((nx, nz, ny, cost))
 
     return neighbors
+
+
+def _can_escape_pit(
+    x: int,
+    z: int,
+    surface_y: int,
+    heightmap: dict[tuple[int, int], int],
+    solid_blocks: set[tuple[int, int, int]],
+    liquid_blocks: set[tuple[int, int, int]],
+    max_search: int = 16
+) -> bool:
+    """
+    Check if a position can escape to higher ground via reversible moves.
+
+    When considering a 2-block drop, we need to ensure the bot can eventually
+    climb back out. This does a limited BFS to find if there's any path to
+    higher ground (step-up) from the landing position using only reversible moves.
+
+    Args:
+        x, z: Position to check
+        surface_y: Surface height at this position
+        heightmap: Walkable surface heights
+        solid_blocks: Set of solid block positions
+        liquid_blocks: Set of liquid block positions
+        max_search: Maximum positions to check (limits search cost)
+
+    Returns:
+        True if position can reach higher ground, False if it's a trap
+    """
+    directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+    # BFS to find any step-up exit within reachable area
+    visited: set[tuple[int, int]] = set()
+    queue = [(x, z, surface_y)]
+    visited.add((x, z))
+
+    positions_checked = 0
+
+    while queue and positions_checked < max_search:
+        cx, cz, cy = queue.pop(0)
+        positions_checked += 1
+
+        for dx, dz in directions:
+            nx, nz = cx + dx, cz + dz
+            key = (nx, nz)
+
+            if key in visited:
+                continue
+
+            if key not in heightmap:
+                continue
+
+            ny = heightmap[key]
+
+            # Check for liquid
+            if (nx, ny, nz) in liquid_blocks or (nx, ny + 1, nz) in liquid_blocks:
+                continue
+
+            height_diff = ny - cy
+
+            # If we found a step-up, we can escape
+            if height_diff == 1:
+                # Verify body clearance and head clearance for the step up
+                if _has_body_clearance(nx, ny, nz, solid_blocks, heightmap):
+                    if (cx, cy + 2, cz) not in solid_blocks:
+                        return True
+
+            # For BFS, only explore same-level or step-down-1 (reversible from current)
+            if height_diff <= 0 and height_diff >= -1:
+                if _has_body_clearance(nx, ny, nz, solid_blocks, heightmap):
+                    visited.add(key)
+                    queue.append((nx, nz, ny))
+
+    return False
 
 
 def _heuristic(x1: int, z1: int, x2: int, z2: int) -> float:
@@ -562,12 +648,74 @@ def find_safe_path(
         path = _astar(start, goal_xz, heightmap, solid_blocks, liquid_blocks, allow_2_block_drop=True)
 
     if path is None:
+        # Diagnose why pathfinding failed
+        start_key = (start_x, start_z)
+        valid_start = _find_valid_start(start_x, start_y, start_z, heightmap)
+
+        if valid_start is None:
+            # Check what's in heightmap near start
+            nearby = [(start_x + dx, start_z + dz) for dx in range(-2, 3) for dz in range(-2, 3)]
+            heightmap_near_start = {k: heightmap.get(k) for k in nearby if heightmap.get(k) is not None}
+            reason = (
+                f"No valid start position found. "
+                f"Bot at y={start_y}, heightmap entries near start: {heightmap_near_start}"
+            )
+        else:
+            # Check if start has any walkable neighbors
+            sx, sy, sz = valid_start
+            neighbors = _get_walkable_neighbors(
+                sx, sz, sy, heightmap, solid_blocks, liquid_blocks, allow_2_block_drop=True
+            )
+            if not neighbors:
+                # Check why each direction fails
+                directions_info = []
+                for dx, dz in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                    nx, nz = sx + dx, sz + dz
+                    key = (nx, nz)
+                    if key not in heightmap:
+                        directions_info.append(f"({dx},{dz}): not in heightmap")
+                    else:
+                        ny = heightmap[key]
+                        height_diff = ny - sy
+                        if height_diff > 1:
+                            directions_info.append(f"({dx},{dz}): too high (diff={height_diff})")
+                        elif height_diff < -2:
+                            directions_info.append(f"({dx},{dz}): too low (diff={height_diff})")
+                        elif not _has_body_clearance(nx, ny, nz, solid_blocks, heightmap):
+                            # Find why body clearance fails
+                            body_y = ny + 1
+                            head_y = ny + 2
+                            bc_reasons = []
+                            if (nx, body_y, nz) in solid_blocks:
+                                bc_reasons.append(f"solid at body ({nx},{body_y},{nz})")
+                            if (nx, head_y, nz) in solid_blocks:
+                                bc_reasons.append(f"solid at head ({nx},{head_y},{nz})")
+                            # Check adjacent
+                            for adx, adz in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                                adj_x, adj_z = nx + adx, nz + adz
+                                adj_key = (adj_x, adj_z)
+                                adj_surface = heightmap.get(adj_key)
+                                if adj_surface is not None and adj_surface > ny + 1:
+                                    continue  # Wall, skip
+                                if adj_surface is None or body_y != adj_surface:
+                                    if (adj_x, body_y, adj_z) in solid_blocks:
+                                        bc_reasons.append(f"adj solid at body ({adj_x},{body_y},{adj_z})")
+                                if adj_surface is None or head_y != adj_surface:
+                                    if (adj_x, head_y, adj_z) in solid_blocks:
+                                        bc_reasons.append(f"adj solid at head ({adj_x},{head_y},{adj_z})")
+                            directions_info.append(f"({dx},{dz}): body clearance fail: {bc_reasons}")
+                        else:
+                            directions_info.append(f"({dx},{dz}): unknown fail")
+                reason = f"Start valid at ({sx},{sy},{sz}) but no walkable neighbors: {directions_info}"
+            else:
+                reason = f"No safe path found (A* exhausted). Start=({sx},{sy},{sz}), goal={goal_xz}, neighbors_count={len(neighbors)}"
+
         return {
             "success": False,
             "waypoints": [],
             "reached_target": False,
             "distance_to_target": math.sqrt((target_x - start_x) ** 2 + (target_z - start_z) ** 2),
-            "reason": "No safe path found"
+            "reason": reason
         }
 
     # Convert path to waypoints

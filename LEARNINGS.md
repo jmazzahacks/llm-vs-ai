@@ -1613,5 +1613,92 @@ This correctly:
 
 **File:** `python-vs-core/src/vintage_story_core/pathfinding.py` lines 135-155
 
+## Key Insights from Session 18 - Trap Avoidance & Long-Distance Testing
+
+### Trap Avoidance in Pathfinding (Fixed)
+
+**Problem:** Bot could walk into "traps" - non-reversible dead ends like pits. The pathfinder allowed 2-block drops as a fallback, but didn't check if the landing position had a way out.
+
+**Example scenario:**
+```
+Ground level: Y=115
+Pit floor:    Y=113 (2-block drop allowed)
+Pit walls:    All directions blocked or requiring step-up
+```
+
+Bot would drop into the pit, then be unable to escape because it can only step UP 1 block.
+
+**Solution:** Added `_can_escape_pit()` function that performs BFS to verify the landing position can reach higher ground:
+
+```python
+def _can_escape_pit(x, z, surface_y, heightmap, solid_blocks, liquid_blocks, max_search=16):
+    """
+    Before allowing a 2-block drop, verify the bot can escape via BFS.
+    Searches for any reachable step-up (1 block higher) within limited area.
+    """
+    directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    visited = set()
+    queue = [(x, z, surface_y)]
+    visited.add((x, z))
+    positions_checked = 0
+
+    while queue and positions_checked < max_search:
+        cx, cz, cy = queue.pop(0)
+        positions_checked += 1
+
+        for dx, dz in directions:
+            nx, nz = cx + dx, cz + dz
+            # ... check for step-up exits or continue BFS on walkable terrain
+            if height_diff == 1 and has_clearance:
+                return True  # Found escape route
+            if -1 <= height_diff <= 0 and has_clearance:
+                queue.append((nx, nz, ny))  # Continue searching
+
+    return False  # No escape found - don't allow the drop
+```
+
+**Key implementation details:**
+- Only affects 2-block drops (1-block drops are always reversible)
+- BFS limited to 16 positions to avoid expensive searches
+- Looks for any step-up within reachable area (not just adjacent)
+- Added to `_get_walkable_neighbors()` before allowing 2-block drop
+
+**File:** `python-vs-core/src/vintage_story_core/pathfinding.py`
+
+### Long-Distance Bot Movement - CONFIRMED WORKING!
+
+**Test results:**
+- Bot successfully traveled **317+ blocks** from player
+- All four entity properties working correctly:
+  - `AlwaysActive => true`
+  - `ShouldDespawn => false`
+  - `AllowOutsideLoadedRange => true`
+  - `SimulationRange = 1000`
+
+**Bot status at 317 blocks:**
+```json
+{
+  "alive": true,
+  "health": 20,
+  "onGround": true,
+  "inLoadedEntities": true,
+  "state": "Active"
+}
+```
+
+**Key observations:**
+- A* pathfinding continues to work at 300+ blocks
+- Block scanning works (server has chunk data via force loading)
+- Movement commands execute correctly
+- Bot does NOT despawn when player is far away
+
+**Force chunk loading:** The mod uses `_serverApi.WorldManager.LoadChunkColumnForModifiedEntities()` to keep chunks around the bot loaded, enabling pathfinding to work at any distance.
+
+### Common Obstacles During Navigation
+
+**Trees:** Maple logs and birch branches can block paths. Pathfinder correctly identifies them, but bot_walk can get stuck if terrain not scanned first.
+
+**Birch leaves:** `leavesbranchy-grown*-birch` blocks are solid and have collision, unlike regular leaves.
+
 ---
-*Last updated: Session 18 - Added plank slabs and plank stairs to hidden collision detection. These partial blocks at trader outposts have collision geometry despite isSolid=false.*
+*Last updated: Session 18 - Added trap avoidance to pathfinding, confirmed long-distance (317+ blocks) bot movement working.*
