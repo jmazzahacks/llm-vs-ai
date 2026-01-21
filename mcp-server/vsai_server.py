@@ -266,6 +266,21 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="bot_chat_location",
+            description="Send a chat message with a location, automatically converting absolute coordinates to relative coordinates (subtracts 512000 from X and Z) so they match what players see on screen.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Message prefix (e.g., 'Found copper at')"},
+                    "x": {"type": "number", "description": "Absolute X coordinate"},
+                    "y": {"type": "number", "description": "Y coordinate (unchanged)"},
+                    "z": {"type": "number", "description": "Absolute Z coordinate"},
+                    "name": {"type": "string", "description": "Bot name to display (default: 'Bot')", "default": "Bot"}
+                },
+                "required": ["message", "x", "y", "z"]
+            }
+        ),
+        Tool(
             name="screenshot",
             description="Take a screenshot of the game.",
             inputSchema={
@@ -495,6 +510,20 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     elif name == "bot_chat":
         return http_post("/bot/chat", {
             "message": arguments["message"],
+            "name": arguments.get("name", "Bot")
+        })
+
+    elif name == "bot_chat_location":
+        # Convert absolute coordinates to relative (subtract 512000 from X and Z)
+        rel_x = int(arguments["x"] - 512000)
+        rel_z = int(arguments["z"] - 512000)
+        y = int(arguments["y"])
+
+        # Format message with relative coordinates
+        full_message = f"{arguments['message']} ({rel_x}, {y}, {rel_z})"
+
+        return http_post("/bot/chat", {
+            "message": full_message,
             "name": arguments.get("name", "Bot")
         })
 
