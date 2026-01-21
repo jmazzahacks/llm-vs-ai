@@ -1501,6 +1501,8 @@ With `SimulationRange = 1000`:
 |------------|---------------|-------|
 | **Microblocks** | `chiseledblock-*`, `microblock-*` | Player-placed decorative blocks. Have complex hitboxes |
 | **Doors** | `door-*`, `roughhewnfencegate-*` | Closed doors are impassable despite isSolid=false |
+| **Plank slabs** | `plankslab-oak-up-free` | Partial blocks at trader outposts |
+| **Plank stairs** | `plankstairs-oak-down-west-free` | Stair blocks at trader outposts |
 | **Ground storage** | `groundstorage` | Items placed on ground |
 | **Toolracks** | `toolrack-*` | Wall-mounted storage |
 | **Storage vessels** | `storagevessel-*` | Large clay containers |
@@ -1538,6 +1540,10 @@ def _has_hidden_collision(code: str) -> bool:
         "storagevessel", "stationarybasket", "crate-", "barrel-",
         "shelf-", "toolrack", "displaycase", "groundstorage"
     ]):
+        return True
+
+    # Plank slabs and stairs - partial blocks with collision
+    if "plankslab" in code_lower or "plankstairs" in code_lower:
         return True
 
     # Wagon parts, crafting stations, beds, signs, etc.
@@ -1608,4 +1614,4 @@ This correctly:
 **File:** `python-vs-core/src/vintage_story_core/pathfinding.py` lines 135-155
 
 ---
-*Last updated: Session 17 - Fixed hidden collision detection (fences, doors, chiseled blocks, etc.) and adjacent cliff detection bugs in pathfinder. Both fixes ensure the bot properly routes around obstacles that have collision geometry despite isSolid=false.*
+*Last updated: Session 18 - Added plank slabs and plank stairs to hidden collision detection. These partial blocks at trader outposts have collision geometry despite isSolid=false.*

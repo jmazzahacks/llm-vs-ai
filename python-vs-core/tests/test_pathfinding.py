@@ -489,3 +489,45 @@ class TestHiddenCollision:
         for wp in result["waypoints"]:
             if wp["x"] == 3:
                 assert wp["z"] < -5 or wp["z"] >= 6
+
+    def test_path_around_plank_slabs(self) -> None:
+        """Bot paths around plank slabs despite isSolid=false."""
+        blocks = make_flat_terrain(0, 0, 100, 8)
+        # Add plank slab wall at head level (y=102, bot walks at y=101)
+        for z in range(-5, 6):
+            blocks.append({
+                "x": 3, "y": 102, "z": z,
+                "code": "game:plankslab-oak-up-free", "isSolid": False
+            })
+
+        current = {"x": 0.5, "y": 101.0, "z": 0.5}
+        target = {"x": 6.5, "y": 101.0, "z": 0.5}
+
+        result = find_safe_path(current, target, blocks)
+
+        assert result["success"] is True
+        # Path should go around the plank slabs
+        for wp in result["waypoints"]:
+            if wp["x"] == 3:
+                assert wp["z"] < -5 or wp["z"] >= 6
+
+    def test_path_around_plank_stairs(self) -> None:
+        """Bot paths around plank stairs despite isSolid=false."""
+        blocks = make_flat_terrain(0, 0, 100, 8)
+        # Add plank stairs wall at head level
+        for z in range(-5, 6):
+            blocks.append({
+                "x": 3, "y": 102, "z": z,
+                "code": "game:plankstairs-oak-down-west-free", "isSolid": False
+            })
+
+        current = {"x": 0.5, "y": 101.0, "z": 0.5}
+        target = {"x": 6.5, "y": 101.0, "z": 0.5}
+
+        result = find_safe_path(current, target, blocks)
+
+        assert result["success"] is True
+        # Path should go around the plank stairs
+        for wp in result["waypoints"]:
+            if wp["x"] == 3:
+                assert wp["z"] < -5 or wp["z"] >= 6

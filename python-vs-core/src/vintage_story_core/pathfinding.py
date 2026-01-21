@@ -96,6 +96,10 @@ def _has_hidden_collision(code: str) -> bool:
     if "sign-" in code_lower and "post" in code_lower:
         return True
 
+    # Plank slabs and stairs - partial blocks with collision
+    if "plankslab" in code_lower or "plankstairs" in code_lower:
+        return True
+
     return False
 
 

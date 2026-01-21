@@ -246,17 +246,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="bot_blocks",
-            description="Scan blocks around the bot in a given radius. Use visibility_filter to only return blocks visible via line-of-sight (like a player would see). Use filter to search for specific block types by keyword.",
+            description="Scan blocks around the bot in a given radius. Only returns surface blocks (visible with exposed face). Use filter to search for specific block types by keyword.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "radius": {"type": "integer", "description": "Scan radius in blocks (default: 3)", "default": 3},
-                    "visibility_filter": {
-                        "type": "string",
-                        "description": "Filter blocks by visibility: 'none' (all blocks), 'visible' (line-of-sight), 'surface' (visible + exposed face). Default: 'surface'",
-                        "enum": ["none", "visible", "surface"],
-                        "default": "surface"
-                    },
                     "filter": {
                         "type": "string",
                         "description": "Keyword filter for block codes (case-insensitive). Use comma to match multiple keywords, e.g. 'flint,stone' matches blocks containing 'flint' OR 'stone'."
@@ -587,7 +581,6 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
     elif name == "bot_blocks":
         radius = arguments.get("radius", 3)
-        visibility_filter = arguments.get("visibility_filter", "surface")
         keyword_filter = arguments.get("filter", None)
 
         # Get raw blocks from API
@@ -604,13 +597,8 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         observer_pos = bot_obs["bot"]["position"]
         blocks = result.get("blocks", [])
 
-        # Apply visibility filtering
-        if visibility_filter == "none":
-            filtered = blocks
-        elif visibility_filter == "visible":
-            filtered = filter_visible_blocks(observer_pos, blocks)
-        else:  # "surface" (default)
-            filtered = get_visible_surface_blocks(observer_pos, blocks)
+        # Apply surface visibility filtering (always enabled)
+        filtered = get_visible_surface_blocks(observer_pos, blocks)
 
         # Apply keyword filtering if specified
         if keyword_filter:
@@ -624,7 +612,7 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "success": True,
             "botPosition": observer_pos,
             "radius": radius,
-            "visibilityFilter": visibility_filter,
+            "visibilityFilter": "surface",
             "keywordFilter": keyword_filter,
             "totalBlocksScanned": len(blocks),
             "visibleBlockCount": len(filtered),
