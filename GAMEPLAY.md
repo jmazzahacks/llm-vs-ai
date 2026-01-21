@@ -35,6 +35,29 @@ When pathfinding fails or the bot gets stuck:
 - **Short-distance goto (10 blocks):** More reliable, pathfinding explores more thoroughly
 - **Strategy:** For long journeys, consider breaking into shorter segments if you encounter stuck issues
 
+### DANGER: Never Use Direct Walk in Unknown Terrain
+
+**`bot_walk` bypasses A* pathfinding entirely** - it walks in a straight line toward the target with no hazard detection.
+
+**When NOT to use `bot_walk`:**
+- In unexplored terrain
+- When pathfinding repeatedly fails (this often means the terrain is dangerous!)
+- Near cliffs, ravines, or holes
+- When you can't visually confirm the path is clear
+
+**When `bot_walk` is safe:**
+- Following a path you've already confirmed with pathfinding
+- Short distances on flat, visible terrain
+- As a last resort when truly stuck (but expect potential falls)
+
+**Lesson learned:** During a long-distance test, pathfinding kept failing in difficult terrain. Using `bot_walk` as a fallback resulted in the bot falling into a deep hole (23-block drop). The pathfinder was failing because the terrain WAS dangerous - it was doing its job by refusing to find a path through hazardous areas.
+
+**If pathfinding fails repeatedly:** Don't bypass it. Instead:
+1. Try a different direction
+2. Backtrack to safer terrain
+3. Ask for player assistance
+4. Accept that some terrain is impassable
+
 ---
 
 ## Coordinates

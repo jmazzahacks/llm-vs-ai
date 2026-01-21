@@ -84,6 +84,19 @@ def wait_for_movement_complete() -> dict[str, Any]:
         current_status = status.get("status", "unknown")
         is_active = status.get("isActive", False)
 
+        # Check for bot despawn
+        bot_status = http_get("/bot/observe")
+        if "bot" in bot_status:
+            bot_state = bot_status["bot"].get("state", "")
+            in_loaded = bot_status["bot"].get("inLoadedEntities", True)
+            if bot_state == "Despawned" or not in_loaded:
+                return {
+                    "error": "Bot despawned during movement",
+                    "status": "despawned",
+                    "position": status.get("position", {}),
+                    "statusMessage": "Bot unexpectedly despawned"
+                }
+
         # Check for terminal state with no active movement
         if current_status in terminal_states and not is_active:
             # Confirm by waiting one more poll
@@ -118,6 +131,19 @@ def wait_for_direct_walk_complete() -> dict[str, Any]:
 
         current_status = status.get("status", "unknown")
         is_direct_walking = status.get("isDirectWalking", False)
+
+        # Check for bot despawn
+        bot_status = http_get("/bot/observe")
+        if "bot" in bot_status:
+            bot_state = bot_status["bot"].get("state", "")
+            in_loaded = bot_status["bot"].get("inLoadedEntities", True)
+            if bot_state == "Despawned" or not in_loaded:
+                return {
+                    "error": "Bot despawned during movement",
+                    "status": "despawned",
+                    "position": status.get("position", {}),
+                    "statusMessage": "Bot unexpectedly despawned"
+                }
 
         # Check if direct walking has completed
         if not is_direct_walking and current_status in terminal_states:
