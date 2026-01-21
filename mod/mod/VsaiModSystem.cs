@@ -32,6 +32,14 @@ public class VsaiModSystem : ModSystem
     // Pathfinding
     private AStar? _astar;
 
+    // Chunk loading to prevent bot despawning at long distances
+    private HashSet<long> _forceLoadedChunks = new HashSet<long>();
+    private int _lastBotChunkX = int.MinValue;
+    private int _lastBotChunkZ = int.MinValue;
+    private long _chunkTickListenerId;
+    private const int ChunkLoadRadius = 3;  // Load 7x7 chunks (3 in each direction from center)
+    private const int ChunkSize = 32;  // VS chunk size in blocks
+
     private const int DefaultPort = 4560;
     private const string DefaultHost = "localhost";
 
@@ -64,6 +72,9 @@ public class VsaiModSystem : ModSystem
         // Register entity death handler to track bot deaths
         api.Event.OnEntityDeath += OnEntityDeath;
 
+        // Register tick listener for chunk loading (every 500ms)
+        _chunkTickListenerId = api.Event.RegisterGameTickListener(OnChunkTickUpdate, 500);
+
         StartHttpServer();
 
         _serverApi.Logger.Notification($"[VSAI] HTTP server started on http://{DefaultHost}:{DefaultPort}");
@@ -88,9 +99,121 @@ public class VsaiModSystem : ModSystem
 
     public override void Dispose()
     {
+        // Unregister tick listener
+        if (_serverApi != null && _chunkTickListenerId != 0)
+        {
+            _serverApi.Event.UnregisterGameTickListener(_chunkTickListenerId);
+        }
+
+        // Unload all force-loaded chunks
+        UnloadAllForceLoadedChunks();
+
         DespawnBot();
         StopHttpServer();
         base.Dispose();
+    }
+
+    /// <summary>
+    /// Periodic tick to ensure chunks around the bot are loaded.
+    /// This prevents the bot from despawning when far from the player.
+    /// </summary>
+    private void OnChunkTickUpdate(float dt)
+    {
+        if (_botEntity == null || !_botEntity.Alive || _serverApi == null) return;
+
+        var pos = _botEntity.ServerPos;
+        int currentChunkX = (int)Math.Floor(pos.X / ChunkSize);
+        int currentChunkZ = (int)Math.Floor(pos.Z / ChunkSize);
+
+        // Only update if bot has moved to a different chunk region
+        if (currentChunkX == _lastBotChunkX && currentChunkZ == _lastBotChunkZ) return;
+
+        _lastBotChunkX = currentChunkX;
+        _lastBotChunkZ = currentChunkZ;
+
+        EnsureBotChunksLoaded(currentChunkX, currentChunkZ);
+    }
+
+    /// <summary>
+    /// Force-load chunks around the bot to prevent despawning.
+    /// Uses keepLoaded=true to keep chunks loaded until explicitly unloaded.
+    /// </summary>
+    private void EnsureBotChunksLoaded(int centerChunkX, int centerChunkZ)
+    {
+        if (_serverApi == null) return;
+
+        var newChunks = new HashSet<long>();
+
+        // Load chunks in a square around the bot
+        for (int dx = -ChunkLoadRadius; dx <= ChunkLoadRadius; dx++)
+        {
+            for (int dz = -ChunkLoadRadius; dz <= ChunkLoadRadius; dz++)
+            {
+                int cx = centerChunkX + dx;
+                int cz = centerChunkZ + dz;
+                long key = ChunkKey(cx, cz);
+                newChunks.Add(key);
+
+                // Load chunk if not already force-loaded
+                if (!_forceLoadedChunks.Contains(key))
+                {
+                    _serverApi.WorldManager.LoadChunkColumn(cx, cz, true);  // keepLoaded=true
+                }
+            }
+        }
+
+        // Unload chunks we no longer need
+        foreach (var key in _forceLoadedChunks)
+        {
+            if (!newChunks.Contains(key))
+            {
+                int cx = (int)(key >> 32);
+                int cz = (int)(key & 0xFFFFFFFF);
+                _serverApi.WorldManager.UnloadChunkColumn(cx, cz);
+            }
+        }
+
+        int newlyLoaded = newChunks.Count - (_forceLoadedChunks.Intersect(newChunks).Count());
+        int unloaded = _forceLoadedChunks.Count - (_forceLoadedChunks.Intersect(newChunks).Count());
+
+        if (newlyLoaded > 0 || unloaded > 0)
+        {
+            _serverApi.Logger.Debug($"[VSAI] Chunk update: loaded {newlyLoaded} new, unloaded {unloaded} old, total {newChunks.Count} chunks around bot");
+        }
+
+        _forceLoadedChunks = newChunks;
+    }
+
+    /// <summary>
+    /// Unload all force-loaded chunks (called on dispose or bot despawn).
+    /// </summary>
+    private void UnloadAllForceLoadedChunks()
+    {
+        if (_serverApi == null) return;
+
+        foreach (var key in _forceLoadedChunks)
+        {
+            int cx = (int)(key >> 32);
+            int cz = (int)(key & 0xFFFFFFFF);
+            _serverApi.WorldManager.UnloadChunkColumn(cx, cz);
+        }
+
+        if (_forceLoadedChunks.Count > 0)
+        {
+            _serverApi.Logger.Notification($"[VSAI] Unloaded {_forceLoadedChunks.Count} force-loaded chunks");
+        }
+
+        _forceLoadedChunks.Clear();
+        _lastBotChunkX = int.MinValue;
+        _lastBotChunkZ = int.MinValue;
+    }
+
+    /// <summary>
+    /// Encode chunk coordinates as a single long for use as a HashSet key.
+    /// </summary>
+    private static long ChunkKey(int chunkX, int chunkZ)
+    {
+        return ((long)chunkX << 32) | (uint)chunkZ;
     }
 
     private void StartHttpServer()
@@ -569,10 +692,17 @@ public class VsaiModSystem : ModSystem
                 _serverApi.World.SpawnEntity(_botEntity);
                 _botEntityId = _botEntity.EntityId;
 
+                // Force load chunks around the spawn position
+                int spawnChunkX = (int)Math.Floor(spawnPos.X / ChunkSize);
+                int spawnChunkZ = (int)Math.Floor(spawnPos.Z / ChunkSize);
+                _lastBotChunkX = spawnChunkX;
+                _lastBotChunkZ = spawnChunkZ;
+                EnsureBotChunksLoaded(spawnChunkX, spawnChunkZ);
+
                 // Log entity count after spawn
                 int afterCount = _serverApi.World.LoadedEntities.Values.Count(e => e.Code?.Path == "aibot");
                 _serverApi.Logger.Notification($"[VSAI] Bot spawned: {entityCode} at {spawnPos}, EntityId={_botEntityId}");
-                _serverApi.Logger.Notification($"[VSAI] After spawn: {afterCount} aibot entities in LoadedEntities");
+                _serverApi.Logger.Notification($"[VSAI] After spawn: {afterCount} aibot entities in LoadedEntities, {_forceLoadedChunks.Count} chunks force-loaded");
                 success = true;
             }
             catch (Exception ex)
@@ -629,6 +759,10 @@ public class VsaiModSystem : ModSystem
 
             _botEntity = null;
             _botEntityId = 0;
+
+            // Unload force-loaded chunks when bot despawns
+            UnloadAllForceLoadedChunks();
+
             _serverApi?.Logger.Notification("[VSAI] Bot despawned");
         }
     }
@@ -661,6 +795,9 @@ public class VsaiModSystem : ModSystem
         // Clear our reference since the bot is dead
         _botEntity = null;
         _botEntityId = 0;
+
+        // Unload force-loaded chunks when bot dies
+        UnloadAllForceLoadedChunks();
     }
 
     /// <summary>
