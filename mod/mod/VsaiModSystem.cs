@@ -61,6 +61,9 @@ public class VsaiModSystem : ModSystem
         // Initialize pathfinding
         _astar = new AStar(api);
 
+        // Register entity death handler to track bot deaths
+        api.Event.OnEntityDeath += OnEntityDeath;
+
         StartHttpServer();
 
         _serverApi.Logger.Notification($"[VSAI] HTTP server started on http://{DefaultHost}:{DefaultPort}");
@@ -631,6 +634,36 @@ public class VsaiModSystem : ModSystem
     }
 
     /// <summary>
+    /// Called when any entity dies. We track bot deaths to help diagnose issues.
+    /// </summary>
+    private void OnEntityDeath(Entity entity, DamageSource? damageSource)
+    {
+        // Only care about our tracked bot
+        if (entity.EntityId != _botEntityId) return;
+
+        var pos = entity.ServerPos;
+        string damageInfo = "unknown cause";
+
+        if (damageSource != null)
+        {
+            var sourceEntity = damageSource.SourceEntity;
+            var causeEntity = damageSource.CauseEntity;
+            string sourceName = sourceEntity?.Code?.Path ?? "none";
+            string causeName = causeEntity?.Code?.Path ?? "none";
+
+            damageInfo = $"type={damageSource.Type}, source={sourceName}, cause={causeName}";
+        }
+
+        _serverApi?.Logger.Notification(
+            $"[VSAI] BOT DIED at ({pos.X:F1}, {pos.Y:F1}, {pos.Z:F1}) - {damageInfo}"
+        );
+
+        // Clear our reference since the bot is dead
+        _botEntity = null;
+        _botEntityId = 0;
+    }
+
+    /// <summary>
     /// Get the AiTaskRemoteControl from the bot entity.
     /// </summary>
     private AiTaskRemoteControl? GetRemoteControlTask()
@@ -719,6 +752,19 @@ public class VsaiModSystem : ModSystem
         bool inLoadedEntities = _serverApi?.World.LoadedEntities.ContainsKey(_botEntityId) ?? false;
         string? entityState = _botEntity.State.ToString();
 
+        // Get health info if available
+        float currentHealth = 0;
+        float maxHealth = 0;
+        if (_botEntity is EntityAgent agent)
+        {
+            var healthBehavior = agent.GetBehavior<EntityBehaviorHealth>();
+            if (healthBehavior != null)
+            {
+                currentHealth = healthBehavior.Health;
+                maxHealth = healthBehavior.MaxHealth;
+            }
+        }
+
         return JsonSerializer.Serialize(new
         {
             bot = new
@@ -727,6 +773,8 @@ public class VsaiModSystem : ModSystem
                 position = new { x = pos.X, y = pos.Y, z = pos.Z },
                 rotation = new { yaw = pos.Yaw, pitch = pos.Pitch },
                 alive = _botEntity.Alive,
+                health = currentHealth,
+                maxHealth = maxHealth,
                 onGround = _botEntity.OnGround,
                 inWater = _botEntity.Swimming,
                 inLoadedEntities = inLoadedEntities,
@@ -745,7 +793,7 @@ public class VsaiModSystem : ModSystem
         int radius = 3;
         if (int.TryParse(request.QueryString["radius"], out int r))
         {
-            radius = Math.Clamp(r, 1, 8);
+            radius = Math.Clamp(r, 1, 32);
         }
 
         var pos = _botEntity.ServerPos.AsBlockPos;

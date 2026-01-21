@@ -10,14 +10,42 @@ import math
 from typing import Any
 
 
+def _is_passable_block(code: str) -> bool:
+    """
+    Check if a block is passable (bot can walk through it).
+
+    Some blocks like leaves are marked as solid in the API but the bot can
+    actually walk through them. This prevents them from blocking pathfinding.
+
+    Note: Woody leaf variants (e.g., birch leaves with -woody-) may have
+    collision, so we exclude those.
+    """
+    code_lower = code.lower()
+
+    # Exclude woody variants - these may have actual collision
+    if "woody" in code_lower:
+        return False
+
+    # Regular leaves and branchy leaves are passable
+    if "leaves" in code_lower:
+        return True
+
+    return False
+
+
 def _build_terrain_data(
-    blocks: list[dict[str, Any]]
+    blocks: list[dict[str, Any]],
+    bot_y: int | None = None
 ) -> tuple[dict[tuple[int, int], int], set[tuple[int, int, int]], set[tuple[int, int, int]]]:
     """
     Build terrain data structures from block scan.
 
+    Args:
+        blocks: Raw block data from API
+        bot_y: Bot's current Y position (used to prefer nearby surfaces in buildings)
+
     Returns:
-        heightmap: (x, z) -> highest walkable surface y
+        heightmap: (x, z) -> walkable surface y (prefers surface near bot_y if provided)
         solid_blocks: set of all solid block positions
         liquid_blocks: set of all liquid block positions
     """
@@ -36,12 +64,17 @@ def _build_terrain_data(
         is_solid = block.get("isSolid", True)
         is_liquid = "water" in code.lower() or "lava" in code.lower() or "liquid" in code.lower()
 
+        # Check if block is passable (solid in API but walkable through)
+        is_passable = _is_passable_block(code)
+
         if is_liquid:
             liquid_blocks.add((x, y, z))
-        elif is_solid:
+        elif is_solid and not is_passable:
             solid_blocks.add((x, y, z))
 
-    # Build heightmap: for each (x, z), find highest solid with non-solid above
+    # Build heightmap: for each (x, z), find walkable surface
+    # If bot_y is provided, prefer surfaces close to bot's level (for buildings with roofs)
+    # Otherwise, use highest surface (outdoor terrain)
     heightmap: dict[tuple[int, int], int] = {}
 
     for x, y, z in solid_blocks:
@@ -50,8 +83,18 @@ def _build_terrain_data(
 
         # Walkable if block above is not solid (air or liquid counts as non-solid for surface)
         if above not in solid_blocks:
-            if key not in heightmap or y > heightmap[key]:
+            if key not in heightmap:
                 heightmap[key] = y
+            elif bot_y is not None:
+                # Prefer surface closest to bot's Y position (bot stands at surface_y + 1)
+                current_dist = abs(heightmap[key] - (bot_y - 1))
+                new_dist = abs(y - (bot_y - 1))
+                if new_dist < current_dist:
+                    heightmap[key] = y
+            else:
+                # No bot_y provided, use highest surface
+                if y > heightmap[key]:
+                    heightmap[key] = y
 
     return heightmap, solid_blocks, liquid_blocks
 
@@ -148,6 +191,51 @@ def _heuristic(x1: int, z1: int, x2: int, z2: int) -> float:
     return abs(x2 - x1) + abs(z2 - z1)
 
 
+def _find_valid_start(
+    bot_x: int,
+    bot_y: int,
+    bot_z: int,
+    heightmap: dict[tuple[int, int], int]
+) -> tuple[int, int, int] | None:
+    """
+    Find a valid starting position near the bot's location.
+
+    The bot's Y coordinate is at standing level (air block where feet are),
+    while heightmap stores surface Y (solid block below feet). Expected
+    difference is ~1, but floor() rounding and terrain variation can cause
+    the initial lookup to miss.
+
+    Searches the exact position first, then nearby cells within 1 block.
+
+    Returns:
+        (x, surface_y, z) if found, None if no valid start found
+    """
+    # Search order: exact position first, then neighbors
+    search_offsets = [
+        (0, 0),   # Exact position
+        (1, 0), (-1, 0), (0, 1), (0, -1),  # Cardinal neighbors
+        (1, 1), (1, -1), (-1, 1), (-1, -1),  # Diagonal neighbors
+    ]
+
+    for dx, dz in search_offsets:
+        check_x = bot_x + dx
+        check_z = bot_z + dz
+        key = (check_x, check_z)
+
+        if key not in heightmap:
+            continue
+
+        surface_y = heightmap[key]
+
+        # Bot stands at surface_y + 1 (air block)
+        # Allow tolerance of 2 to handle terrain variation and rounding
+        # Expected: bot_y = surface_y + 1, so difference should be ~1
+        if abs(surface_y - bot_y) <= 2:
+            return (check_x, surface_y, check_z)
+
+    return None
+
+
 def _astar(
     start: tuple[int, int, int],
     goal: tuple[int, int],
@@ -170,19 +258,14 @@ def _astar(
     Returns:
         List of (x, y, z) waypoints or None if no path found
     """
-    start_xz = (start[0], start[2])
-    start_y = start[1]
-
-    # Verify start is walkable
-    if start_xz not in heightmap:
-        # Try to find closest walkable start
+    # Find a valid starting position near the bot
+    # This handles floor() rounding and terrain variation
+    valid_start = _find_valid_start(start[0], start[1], start[2], heightmap)
+    if valid_start is None:
         return None
 
-    # Use heightmap y for start if different (bot might be slightly off)
-    if abs(heightmap[start_xz] - start_y) <= 1:
-        start_y = heightmap[start_xz]
-    else:
-        return None
+    start_x, start_y, start_z = valid_start
+    start_xz = (start_x, start_z)
 
     # Priority queue: (f_score, counter, x, z, y)
     counter = 0
@@ -310,8 +393,8 @@ def find_safe_path(
     target_x = int(math.floor(target_pos["x"]))
     target_z = int(math.floor(target_pos["z"]))
 
-    # Build terrain data
-    heightmap, solid_blocks, liquid_blocks = _build_terrain_data(blocks)
+    # Build terrain data (pass bot_y to prefer surfaces at bot's level in buildings)
+    heightmap, solid_blocks, liquid_blocks = _build_terrain_data(blocks, bot_y=start_y)
 
     if not heightmap:
         return {
@@ -361,7 +444,10 @@ def find_safe_path(
         }
 
     # Convert path to waypoints
-    waypoints = [{"x": p[0], "y": p[1], "z": p[2]} for p in path]
+    # IMPORTANT: Path Y values are surface block Y (what bot stands ON)
+    # Waypoints need to be at standing position Y+1 (where bot's feet are)
+    # This ensures bot_walk targets the correct elevation for step-ups
+    waypoints = [{"x": p[0], "y": p[1] + 1, "z": p[2]} for p in path]
 
     # Calculate final distance to original target
     final_pos = path[-1]

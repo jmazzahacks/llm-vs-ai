@@ -1255,7 +1255,7 @@ The bot marker is a cyan (turquoise) circle with a white center dot, making it d
    - Minimap visibility limited to ~128 blocks (client chunk loading)
    - When player returns within range, bot can move again immediately
 
-   **IMPORTANT:** `AlwaysActive` alone is NOT sufficient for long-distance movement. See "Entity Simulation Range" section below for the complete solution.
+   **IMPORTANT:** `AlwaysActive` alone is NOT sufficient for long-distance movement. See "Entity Simulation Range" section below for the complete four-property solution (AlwaysActive, ShouldDespawn, SimulationRange, AllowOutsideLoadedRange).
 
    **Direct Walk (`/bot/walk`):** Bypasses A* pathfinding but still requires entity simulation. Useful when pathfinding fails due to terrain complexity.
 
@@ -1415,9 +1415,10 @@ The `SimulationRange` property on `Entity` controls this distance threshold. Def
 ```csharp
 public class EntityAiBot : EntityAgent
 {
-    public override bool StoreWithChunk => false;  // Don't persist
-    public override bool AlwaysActive => true;     // Stay active regardless of distance
-    public override bool ShouldDespawn => false;   // Prevent removal from LoadedEntities
+    public override bool StoreWithChunk => false;           // Don't persist to save file
+    public override bool AlwaysActive => true;              // Stay active regardless of distance
+    public override bool ShouldDespawn => false;            // Don't flag for despawn
+    public override bool AllowOutsideLoadedRange => true;   // Exist beyond loaded chunks
 
     public override void Initialize(EntityProperties properties, ICoreAPI api, long InChunkIndex3d)
     {
@@ -1429,20 +1430,28 @@ public class EntityAiBot : EntityAgent
 }
 ```
 
-**The Three Properties for Long-Distance Bot Movement:**
+**The Four Properties for Long-Distance Bot Movement:**
 
 | Property | Purpose | Without It |
 |----------|---------|------------|
 | `AlwaysActive => true` | Keeps entity ticking regardless of player distance | Entity stops simulating when far from player |
 | `SimulationRange = 1000` | Extends physics simulation range to 1000 blocks | Physics (movement) stops at ~128 blocks |
-| `ShouldDespawn => false` | **CRITICAL** Prevents entity removal during chunk unload | Entity removed from LoadedEntities at ~325 blocks |
+| `ShouldDespawn => false` | Prevents entity from being flagged for despawn | Entity marked for despawn when chunk unloads |
+| `AllowOutsideLoadedRange => true` | **CRITICAL** Allows entity to exist beyond loaded chunks | Entity removed from LoadedEntities at ~300 blocks |
 
 **Why ShouldDespawn matters:**
 - `AlwaysActive` keeps the entity ticking but doesn't prevent removal from the `LoadedEntities` collection
 - When the bot's chunk unloads (player moves away), VS checks `ShouldDespawn`
 - Default implementation returns `!Alive` (false if alive), but chunk unload logic has additional checks
 - `EntityPlayer` overrides this to `=> false` explicitly - we must do the same
-- Without this override, bot was consistently despawning at ~325 blocks from the player
+
+**Why AllowOutsideLoadedRange is CRITICAL (Session 15 discovery):**
+- Even with `AlwaysActive`, `ShouldDespawn => false`, and `SimulationRange = 1000`, the bot despawned at ~300 blocks
+- `AllowOutsideLoadedRange` defaults to `false` in the base Entity class
+- This property controls "whether entities can exist beyond normally loaded chunk boundaries"
+- When a chunk unloads, VS removes entities that have `AllowOutsideLoadedRange == false` from `LoadedEntities`
+- The bot showed `inLoadedEntities: false` and `state: "Despawned"` at ~300 blocks
+- Setting `AllowOutsideLoadedRange => true` allows the entity to persist when its chunk is not loaded
 - Discovery came from studying the VS API source at https://github.com/anegostudios/vsapi
 
 **Key points:**
@@ -1481,4 +1490,4 @@ With `SimulationRange = 1000`:
 - **Reference:** See vanilla `trader-*.json` entities which have no spawnConditions and only spawn via structures.
 
 ---
-*Last updated: Session 14 - Added ShouldDespawn => false to prevent entity removal from LoadedEntities at ~325 blocks. Combined with AlwaysActive and SimulationRange, this completes the three-property solution for long-distance bot movement.*
+*Last updated: Session 15 - Added AllowOutsideLoadedRange => true to allow entity to exist beyond loaded chunk boundaries. This was the missing fourth property - bot was still despawning at ~300 blocks despite having AlwaysActive, ShouldDespawn, and SimulationRange set. The complete four-property solution is now: AlwaysActive, ShouldDespawn, SimulationRange, and AllowOutsideLoadedRange.*

@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
-from vintage_story_core import filter_visible_blocks, get_visible_surface_blocks
+from vintage_story_core import filter_visible_blocks, get_visible_surface_blocks, find_safe_path
 
 # Configuration
 VS_API_BASE_URL = "http://localhost:4560"
@@ -178,21 +178,22 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
-        Tool(
-            name="bot_goto",
-            description="Command the bot to walk to a position using A* pathfinding. Blocks until the bot reaches the destination or gets stuck. The target Y coordinate must be at actual ground level.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number", "description": "Target X coordinate"},
-                    "y": {"type": "number", "description": "Target Y coordinate (must be at ground level)"},
-                    "z": {"type": "number", "description": "Target Z coordinate"},
-                    "speed": {"type": "number", "description": "Movement speed (default: 0.03)", "default": 0.03},
-                    "relative": {"type": "boolean", "description": "If true, coordinates are relative to current position", "default": False}
-                },
-                "required": ["x", "y", "z"]
-            }
-        ),
+        # TEMPORARILY DISABLED - testing pathfinding without bot_goto
+        # Tool(
+        #     name="bot_goto",
+        #     description="Command the bot to walk to a position using A* pathfinding. Blocks until the bot reaches the destination or gets stuck. The target Y coordinate must be at actual ground level.",
+        #     inputSchema={
+        #         "type": "object",
+        #         "properties": {
+        #             "x": {"type": "number", "description": "Target X coordinate"},
+        #             "y": {"type": "number", "description": "Target Y coordinate (must be at ground level)"},
+        #             "z": {"type": "number", "description": "Target Z coordinate"},
+        #             "speed": {"type": "number", "description": "Movement speed (default: 0.03)", "default": 0.03},
+        #             "relative": {"type": "boolean", "description": "If true, coordinates are relative to current position", "default": False}
+        #         },
+        #         "required": ["x", "y", "z"]
+        #     }
+        # ),
         Tool(
             name="bot_walk",
             description="Command the bot to walk directly to a position (bypasses A* pathfinding). Use this when pathfinding fails, especially for long distances beyond chunk loading range (~128 blocks). Bot walks in a straight line - will not avoid obstacles. Blocks until the bot reaches the destination.",
@@ -362,6 +363,36 @@ async def list_tools() -> list[Tool]:
                     "maxDistance": {"type": "number", "description": "Maximum pickup distance (default: 5)", "default": 5}
                 },
                 "required": []
+            }
+        ),
+        Tool(
+            name="bot_pathfind",
+            description="""Compute a safe path to a target position using A* pathfinding.
+
+CRITICAL: The returned waypoints MUST be followed ONE AT A TIME in sequential order using bot_walk.
+DO NOT skip waypoints or walk directly to the final destination - the path routes around cliffs,
+ravines, water, and other hazards. Skipping waypoints will cause the bot to fall off cliffs and die.
+
+CORRECT: Call bot_walk for waypoint[0], wait for completion, then waypoint[1], etc.
+WRONG: Call bot_walk directly to the final waypoint - bot will walk off a cliff.
+
+The pathfinder analyzes terrain and returns waypoints that:
+- Respect step heights (max 1 block up, 1-2 blocks down)
+- Avoid hazards (water, lava, deep holes)
+- Ensure head clearance (no walking into ceilings)
+- Route around obstacles the bot cannot climb
+
+Returns partial paths when target is outside scan range - follow the partial path,
+then call bot_pathfind again from the new position to continue.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "Target X coordinate"},
+                    "y": {"type": "number", "description": "Target Y coordinate"},
+                    "z": {"type": "number", "description": "Target Z coordinate"},
+                    "radius": {"type": "integer", "description": "Scan radius for terrain analysis (default: 32, max: 32)", "default": 32}
+                },
+                "required": ["x", "y", "z"]
             }
         )
     ]
@@ -636,6 +667,41 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if "maxDistance" in arguments:
             data["maxDistance"] = arguments["maxDistance"]
         return http_post("/bot/pickup", data)
+
+    elif name == "bot_pathfind":
+        radius = arguments.get("radius", 32)
+
+        # Get bot's current position
+        bot_obs = http_get("/bot/observe")
+        if "error" in bot_obs:
+            return bot_obs
+
+        current_pos = bot_obs["bot"]["position"]
+
+        # Scan blocks around the bot (need all blocks, not just surface)
+        blocks_result = http_get(f"/bot/blocks?radius={radius}")
+        if "error" in blocks_result:
+            return blocks_result
+
+        blocks = blocks_result.get("blocks", [])
+
+        # Define target position
+        target_pos = {
+            "x": arguments["x"],
+            "y": arguments["y"],
+            "z": arguments["z"]
+        }
+
+        # Compute safe path using Python-side pathfinding
+        path_result = find_safe_path(current_pos, target_pos, blocks, scan_radius=radius)
+
+        # Add context about bot position and target
+        path_result["botPosition"] = current_pos
+        path_result["targetPosition"] = target_pos
+        path_result["scanRadius"] = radius
+        path_result["blocksAnalyzed"] = len(blocks)
+
+        return path_result
 
     else:
         return {"error": f"Unknown tool: {name}"}

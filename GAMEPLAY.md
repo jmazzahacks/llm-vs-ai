@@ -6,6 +6,18 @@ This document contains tips and strategies for AI agents controlling bots in Vin
 
 ## Navigation & Movement
 
+### CRITICAL: Follow Pathfinder Waypoints Sequentially
+
+When using `bot_pathfind` + `bot_walk`:
+
+1. Call `bot_pathfind` to get safe waypoints
+2. Walk to EACH waypoint in sequence - do NOT skip to the final destination
+3. The pathfinder routes around cliffs and hazards; skipping waypoints bypasses safety
+
+**WRONG:** Pathfind returns 30 waypoints, walk directly to final waypoint → bot walks off cliff and dies from fall damage
+
+**CORRECT:** Walk through waypoints in order, or in small batches
+
 ### Getting Unstuck
 
 When pathfinding fails or the bot gets stuck:

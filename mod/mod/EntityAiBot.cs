@@ -31,6 +31,14 @@ public class EntityAiBot : EntityAgent
     public override bool ShouldDespawn => false;
 
     /// <summary>
+    /// Allow the bot to exist beyond normally loaded chunk boundaries.
+    /// Without this (default=false), the entity is removed from LoadedEntities
+    /// when its chunk unloads, even with all other despawn prevention measures.
+    /// This is the key property for long-distance autonomous operation.
+    /// </summary>
+    public override bool AllowOutsideLoadedRange => true;
+
+    /// <summary>
     /// Initialize the entity with extended simulation range.
     /// Default SimulationRange is 128 blocks - we extend to 1000 to allow
     /// the bot to move autonomously at greater distances from the player.
