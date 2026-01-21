@@ -106,7 +106,7 @@ public class VsaiModSystem : ModSystem
         }
 
         // Unload all force-loaded chunks
-        UnloadAllForceLoadedChunks();
+        ClearChunkTrackingState();
 
         DespawnBot();
         StopHttpServer();
@@ -162,47 +162,26 @@ public class VsaiModSystem : ModSystem
             }
         }
 
-        // Unload chunks we no longer need
-        foreach (var key in _forceLoadedChunks)
-        {
-            if (!newChunks.Contains(key))
-            {
-                int cx = (int)(key >> 32);
-                int cz = (int)(key & 0xFFFFFFFF);
-                _serverApi.WorldManager.UnloadChunkColumn(cx, cz);
-            }
-        }
+        // Don't unload old chunks - let VS handle cleanup naturally.
+        // Forcibly unloading can accidentally unload chunks players need.
 
-        int newlyLoaded = newChunks.Count - (_forceLoadedChunks.Intersect(newChunks).Count());
-        int unloaded = _forceLoadedChunks.Count - (_forceLoadedChunks.Intersect(newChunks).Count());
+        int newlyLoaded = newChunks.Count - _forceLoadedChunks.Intersect(newChunks).Count();
 
-        if (newlyLoaded > 0 || unloaded > 0)
+        if (newlyLoaded > 0)
         {
-            _serverApi.Logger.Debug($"[VSAI] Chunk update: loaded {newlyLoaded} new, unloaded {unloaded} old, total {newChunks.Count} chunks around bot");
+            _serverApi.Logger.Debug($"[VSAI] Chunk update: loaded {newlyLoaded} new chunks, total {newChunks.Count} around bot");
         }
 
         _forceLoadedChunks = newChunks;
     }
 
     /// <summary>
-    /// Unload all force-loaded chunks (called on dispose or bot despawn).
+    /// Clear chunk tracking state (called on dispose or bot despawn).
+    /// We don't forcibly unload chunks - let VS handle cleanup naturally
+    /// to avoid accidentally unloading chunks that players need.
     /// </summary>
-    private void UnloadAllForceLoadedChunks()
+    private void ClearChunkTrackingState()
     {
-        if (_serverApi == null) return;
-
-        foreach (var key in _forceLoadedChunks)
-        {
-            int cx = (int)(key >> 32);
-            int cz = (int)(key & 0xFFFFFFFF);
-            _serverApi.WorldManager.UnloadChunkColumn(cx, cz);
-        }
-
-        if (_forceLoadedChunks.Count > 0)
-        {
-            _serverApi.Logger.Notification($"[VSAI] Unloaded {_forceLoadedChunks.Count} force-loaded chunks");
-        }
-
         _forceLoadedChunks.Clear();
         _lastBotChunkX = int.MinValue;
         _lastBotChunkZ = int.MinValue;
@@ -761,7 +740,7 @@ public class VsaiModSystem : ModSystem
             _botEntityId = 0;
 
             // Unload force-loaded chunks when bot despawns
-            UnloadAllForceLoadedChunks();
+            ClearChunkTrackingState();
 
             _serverApi?.Logger.Notification("[VSAI] Bot despawned");
         }
@@ -797,7 +776,7 @@ public class VsaiModSystem : ModSystem
         _botEntityId = 0;
 
         // Unload force-loaded chunks when bot dies
-        UnloadAllForceLoadedChunks();
+        ClearChunkTrackingState();
     }
 
     /// <summary>
