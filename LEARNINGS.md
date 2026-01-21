@@ -1489,5 +1489,123 @@ With `SimulationRange = 1000`:
 - **Solution:** Remove the entire `spawnConditions` section from the entity JSON. VS only spawns entities that have valid spawnConditions - omitting it entirely prevents all natural spawning.
 - **Reference:** See vanilla `trader-*.json` entities which have no spawnConditions and only spawn via structures.
 
+## Key Insights from Session 16 - Collision Detection Bugs
+
+### Blocks with Collision Despite `isSolid: false`
+
+**Critical discovery:** Many block types have collision geometry that blocks entity movement even though the `/bot/blocks` API reports `isSolid: false`. This causes the pathfinder to generate invalid paths.
+
+**Affected block types:**
+
+| Block Type | Example Codes | Notes |
+|------------|---------------|-------|
+| **Microblocks** | `chiseledblock-*`, `microblock-*` | Player-placed decorative blocks. Have complex hitboxes |
+| **Doors** | `door-*`, `roughhewnfencegate-*` | Closed doors are impassable despite isSolid=false |
+| **Ground storage** | `groundstorage` | Items placed on ground |
+| **Toolracks** | `toolrack-*` | Wall-mounted storage |
+| **Storage vessels** | `storagevessel-*` | Large clay containers |
+| **Stationary baskets** | `stationarybasket-*` | Floor containers |
+| **Other containers** | `crate-*`, `barrel-*`, `shelf-*` | Various storage |
+
+**Root cause:** The `isSolid` property in VS block data indicates whether a block is a "full solid cube" for rendering/lighting purposes, NOT whether it has collision. Many interactive objects have collision boxes but aren't considered "solid" blocks.
+
+**Impact on pathfinding:**
+- Pathfinder treats these blocks as passable (air-like)
+- Bot attempts to walk through them but gets stuck
+- Results in "stuck" status with bot unable to reach destination
+
+**Solution (Implemented Session 17):** Added `_has_hidden_collision()` function to pathfinding module that detects blocks with collision based on code patterns:
+
+```python
+def _has_hidden_collision(code: str) -> bool:
+    """Check if a block has collision despite isSolid=false."""
+    code_lower = code.lower()
+
+    # Fences and fence gates
+    if "fence" in code_lower:
+        return True
+
+    # Doors and gates - block when closed
+    if "door" in code_lower or "gate" in code_lower:
+        return True
+
+    # Chiseled/micro blocks
+    if "chiseled" in code_lower or "microblock" in code_lower:
+        return True
+
+    # Storage containers
+    if any(pattern in code_lower for pattern in [
+        "storagevessel", "stationarybasket", "crate-", "barrel-",
+        "shelf-", "toolrack", "displaycase", "groundstorage"
+    ]):
+        return True
+
+    # Wagon parts, crafting stations, beds, signs, etc.
+    # ... (see full implementation in pathfinding.py)
+
+    return False
+```
+
+**Key implementation details:**
+1. Hidden collision blocks are added to `solid_blocks` set (for body clearance checks)
+2. Hidden collision blocks are **excluded** from the heightmap (can't walk ON them, only blocked BY them)
+3. This creates a "wall" effect that forces pathfinder to route around
+
+### bot_walk Terrain Hazards
+
+**bot_walk bypasses all pathfinding** - it walks in a straight line toward the target. This can cause the bot to:
+- Walk off cliffs (tested: 12-block fall, damaged to 14.3/20 HP)
+- Walk into water or lava
+- Walk into walls and get stuck
+
+**When to use bot_walk:**
+- When A* pathfinding fails (e.g., target beyond loaded chunks)
+- In open, flat terrain with clear line of sight
+- Following pathfinder waypoints one at a time
+
+**When NOT to use bot_walk:**
+- In unknown terrain that might have cliffs
+- Near structures with complex geometry
+- For long distances in unmapped areas
+
+### Bot Spawning Near Player
+
+When spawning the bot, it always appears near the player's current position. If the player is in an enclosed space (underground base, building interior), the bot may spawn trapped.
+
+**Workaround:** Player should move to an open area before spawning the bot.
+
+### Adjacent Cliff Detection Bug (Fixed Session 17)
+
+**Problem:** Pathfinder generated paths through narrow passages next to cliffs where the bot couldn't actually fit.
+
+**Example scenario:**
+```
+Bot at (512009, 115, 511994) trying to walk north to (512009, 115, 511993)
+           [cliff Y=116]
+           [cliff Y=115] ← adjacent solid blocks at bot's body level
+[peat bog] [cliff Y=114]
+   bot →   ↑ path goes through here, but bot can't fit
+```
+
+**Root cause:** The `_has_body_clearance` function only checked adjacent blocks when they were at the same heightmap surface level:
+```python
+if adj_key in heightmap and heightmap[adj_key] == surface_y:  # Only same level!
+```
+
+For cliffs at different heights (e.g., surface Y=116 vs destination Y=114), the adjacent check was skipped entirely.
+
+**Fix:** Check adjacent blocks for solid obstructions at body/head level, skipping ONLY when the solid is exactly at the adjacent's surface level (normal ground):
+```python
+if adj_surface is None or body_y != adj_surface:
+    if (adj_x, body_y, adj_z) in solid_blocks:
+        return False
+```
+
+This correctly:
+- Detects cliff faces that block the bot's body (solid at different Y than surface)
+- Allows normal step-up/step-down where adjacent ground is at body level
+
+**File:** `python-vs-core/src/vintage_story_core/pathfinding.py` lines 135-155
+
 ---
-*Last updated: Session 15 - Added AllowOutsideLoadedRange => true to allow entity to exist beyond loaded chunk boundaries. This was the missing fourth property - bot was still despawning at ~300 blocks despite having AlwaysActive, ShouldDespawn, and SimulationRange set. The complete four-property solution is now: AlwaysActive, ShouldDespawn, SimulationRange, and AllowOutsideLoadedRange.*
+*Last updated: Session 17 - Fixed hidden collision detection (fences, doors, chiseled blocks, etc.) and adjacent cliff detection bugs in pathfinder. Both fixes ensure the bot properly routes around obstacles that have collision geometry despite isSolid=false.*

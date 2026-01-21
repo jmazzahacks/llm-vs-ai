@@ -17,17 +17,83 @@ def _is_passable_block(code: str) -> bool:
     Some blocks like leaves are marked as solid in the API but the bot can
     actually walk through them. This prevents them from blocking pathfinding.
 
-    Note: Woody leaf variants (e.g., birch leaves with -woody-) may have
-    collision, so we exclude those.
+    Notes:
+    - Woody leaf variants (e.g., birch leaves with -woody-) have collision
+    - Branchy leaf variants (leavesbranchy-*) have branch collision geometry
+    - Only pure leaf blocks without woody/branchy modifiers are truly passable
     """
     code_lower = code.lower()
 
-    # Exclude woody variants - these may have actual collision
+    # Exclude woody variants - these have actual collision
     if "woody" in code_lower:
         return False
 
-    # Regular leaves and branchy leaves are passable
+    # Exclude branchy variants - these have branch collision geometry
+    if "branchy" in code_lower:
+        return False
+
+    # Regular leaves (without woody/branchy) are passable
     if "leaves" in code_lower:
+        return True
+
+    return False
+
+
+def _has_hidden_collision(code: str) -> bool:
+    """
+    Check if a block has collision despite isSolid=false in the API.
+
+    Many interactive and decorative blocks report isSolid=false (they're not
+    full solid cubes for rendering/lighting), but still have collision boxes
+    that block entity movement.
+
+    This function identifies these blocks so the pathfinder treats them as
+    obstacles even when the API says they're not solid.
+    """
+    code_lower = code.lower()
+
+    # Fences and fence gates - have collision posts/rails
+    if "fence" in code_lower:
+        return True
+
+    # Doors and gates - block when closed (we can't know state, assume blocked)
+    if "door" in code_lower or "gate" in code_lower:
+        return True
+
+    # Chiseled/micro blocks - player-carved blocks with custom collision
+    if "chiseled" in code_lower or "microblock" in code_lower:
+        return True
+
+    # Storage containers - have collision boxes
+    if code_lower in ("groundstorage",):
+        return True
+    if any(pattern in code_lower for pattern in [
+        "storagevessel", "stationarybasket", "crate-", "barrel-",
+        "shelf-", "toolrack", "displaycase"
+    ]):
+        return True
+
+    # Wagon parts and other structures
+    if "wagonwheel" in code_lower or "wagon-" in code_lower:
+        return True
+
+    # Torches and lanterns on ground can block
+    if "lantern" in code_lower and "ground" in code_lower:
+        return True
+
+    # Anvils, forges, and crafting stations
+    if any(pattern in code_lower for pattern in [
+        "anvil", "forge", "helve", "clutch", "pulverizer",
+        "quern", "claypot", "crucible"
+    ]):
+        return True
+
+    # Beds
+    if "bed-" in code_lower:
+        return True
+
+    # Signs (post-mounted ones have collision)
+    if "sign-" in code_lower and "post" in code_lower:
         return True
 
     return False
@@ -51,6 +117,8 @@ def _build_terrain_data(
     """
     solid_blocks: set[tuple[int, int, int]] = set()
     liquid_blocks: set[tuple[int, int, int]] = set()
+    # Track blocks with hidden collision - they're obstacles but not walkable surfaces
+    hidden_collision_blocks: set[tuple[int, int, int]] = set()
 
     for block in blocks:
         # Handle both flat and nested position formats
@@ -67,17 +135,28 @@ def _build_terrain_data(
         # Check if block is passable (solid in API but walkable through)
         is_passable = _is_passable_block(code)
 
+        # Check if block has hidden collision (isSolid=false but still blocks movement)
+        has_hidden_collision = _has_hidden_collision(code)
+
         if is_liquid:
             liquid_blocks.add((x, y, z))
-        elif is_solid and not is_passable:
+        elif (is_solid and not is_passable) or has_hidden_collision:
             solid_blocks.add((x, y, z))
+            if has_hidden_collision:
+                hidden_collision_blocks.add((x, y, z))
 
     # Build heightmap: for each (x, z), find walkable surface
     # If bot_y is provided, prefer surfaces close to bot's level (for buildings with roofs)
     # Otherwise, use highest surface (outdoor terrain)
+    # NOTE: Hidden collision blocks (fences, doors, etc.) are excluded from heightmap
+    # because you can't walk ON TOP of them, only blocked BY them
     heightmap: dict[tuple[int, int], int] = {}
 
     for x, y, z in solid_blocks:
+        # Skip hidden collision blocks - they're not walkable surfaces
+        if (x, y, z) in hidden_collision_blocks:
+            continue
+
         key = (x, z)
         above = (x, y + 1, z)
 
@@ -99,16 +178,59 @@ def _build_terrain_data(
     return heightmap, solid_blocks, liquid_blocks
 
 
-def _has_head_clearance(
+def _has_body_clearance(
     x: int,
     surface_y: int,
     z: int,
-    solid_blocks: set[tuple[int, int, int]]
+    solid_blocks: set[tuple[int, int, int]],
+    heightmap: dict[tuple[int, int], int] | None = None
 ) -> bool:
-    """Check if there's head clearance at a position (standing on surface_y)."""
-    # Bot stands on surface_y, occupies y+1 and y+2
-    head_pos = (x, surface_y + 2, z)
-    return head_pos not in solid_blocks
+    """Check if there's body clearance at a position (standing on surface_y).
+
+    Bot stands ON surface_y block, so bot occupies:
+    - surface_y + 1 (feet/body)
+    - surface_y + 2 (head)
+
+    Both positions must be clear of solid blocks.
+
+    Also checks adjacent blocks for body clearance if heightmap is provided,
+    since the bot's collision box extends ~0.3-0.5 blocks from center. Only
+    checks adjacent positions that are at the SAME surface level (to avoid
+    false positives with step-ups/step-downs).
+    """
+    body_y = surface_y + 1
+    head_y = surface_y + 2
+
+    # Check the exact position
+    if (x, body_y, z) in solid_blocks or (x, head_y, z) in solid_blocks:
+        return False
+
+    if heightmap is not None:
+        # Check adjacent positions for body/head clearance
+        # Bot's collision box extends ~0.3-0.5 blocks into adjacent cells,
+        # so we must check if adjacent cells have solid blocks at body/head level.
+        # This catches narrow passages next to cliffs where the adjacent cliff
+        # blocks the bot even though the destination cell itself is clear.
+        for dx, dz in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            adj_x, adj_z = x + dx, z + dz
+            adj_key = (adj_x, adj_z)
+
+            # Get the adjacent position's ground level (if known)
+            adj_surface = heightmap.get(adj_key)
+
+            # Check body level - but skip if body_y is exactly at the adjacent's
+            # surface level (that's just normal ground, not an obstruction).
+            # This allows step-downs where the source ground is at dest body level.
+            if adj_surface is None or body_y != adj_surface:
+                if (adj_x, body_y, adj_z) in solid_blocks:
+                    return False
+
+            # Check head level - same logic
+            if adj_surface is None or head_y != adj_surface:
+                if (adj_x, head_y, adj_z) in solid_blocks:
+                    return False
+
+    return True
 
 
 def _get_walkable_neighbors(
@@ -165,8 +287,9 @@ def _get_walkable_neighbors(
             # For a 1-wide gap: we can cross if there's ground at ny
             # But a 2+ deep hole at our level is dangerous
 
-        # Check for head clearance at destination
-        if not _has_head_clearance(nx, ny, nz, solid_blocks):
+        # Check for body clearance at destination (both feet/body and head)
+        # Pass heightmap to enable adjacent block checking for wider collision
+        if not _has_body_clearance(nx, ny, nz, solid_blocks, heightmap):
             continue
 
         # Check for head clearance during transition for step up

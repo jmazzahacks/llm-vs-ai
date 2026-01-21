@@ -422,3 +422,70 @@ class TestBuildTerrainData:
         assert (0, 100, 0) in solid
         assert (1, 100, 0) in liquid
         assert (2, 100, 0) in liquid
+
+    def test_hidden_collision_blocks_treated_as_solid(self) -> None:
+        """Blocks with hidden collision (isSolid=false but have collision) are treated as solid."""
+        blocks = [
+            make_block(0, 100, 0),  # Regular solid ground
+            # Fence - has collision despite isSolid=False
+            {"x": 1, "y": 100, "z": 0, "code": "game:woodenfence-oak-ew", "isSolid": False},
+            # Door - has collision despite isSolid=False
+            {"x": 2, "y": 100, "z": 0, "code": "game:door-plank-north", "isSolid": False},
+            # Chiseled block - has collision despite isSolid=False
+            {"x": 3, "y": 100, "z": 0, "code": "game:chiseledblock-stone", "isSolid": False},
+        ]
+
+        heightmap, solid, liquid = _build_terrain_data(blocks)
+
+        # All should be in solid set despite isSolid=False
+        assert (0, 100, 0) in solid  # Regular solid
+        assert (1, 100, 0) in solid  # Fence
+        assert (2, 100, 0) in solid  # Door
+        assert (3, 100, 0) in solid  # Chiseled block
+
+
+class TestHiddenCollision:
+    """Tests for pathfinding around blocks with hidden collision."""
+
+    def test_path_around_fence(self) -> None:
+        """Bot paths around fence despite isSolid=false."""
+        blocks = make_flat_terrain(0, 0, 100, 8)
+        # Add a fence wall across the direct path
+        for z in range(-5, 6):
+            blocks.append({
+                "x": 3, "y": 101, "z": z,
+                "code": "game:woodenfence-oak-ns", "isSolid": False
+            })
+
+        current = {"x": 0.5, "y": 101.0, "z": 0.5}
+        target = {"x": 6.5, "y": 101.0, "z": 0.5}
+
+        result = find_safe_path(current, target, blocks)
+
+        assert result["success"] is True
+        # Path should go around the fence (not through x=3)
+        for wp in result["waypoints"]:
+            if wp["x"] == 3:
+                # If at x=3, must be outside the fence area
+                assert wp["z"] < -5 or wp["z"] >= 6
+
+    def test_path_around_chiseled_block(self) -> None:
+        """Bot paths around chiseled blocks despite isSolid=false."""
+        blocks = make_flat_terrain(0, 0, 100, 8)
+        # Add chiseled block wall
+        for z in range(-5, 6):
+            blocks.append({
+                "x": 3, "y": 101, "z": z,
+                "code": "game:chiseledblock-andesite", "isSolid": False
+            })
+
+        current = {"x": 0.5, "y": 101.0, "z": 0.5}
+        target = {"x": 6.5, "y": 101.0, "z": 0.5}
+
+        result = find_safe_path(current, target, blocks)
+
+        assert result["success"] is True
+        # Path should go around the chiseled blocks
+        for wp in result["waypoints"]:
+            if wp["x"] == 3:
+                assert wp["z"] < -5 or wp["z"] >= 6
