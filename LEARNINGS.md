@@ -414,6 +414,7 @@ The target Y must be at actual ground level (where the bot can stand). If target
 | `/bot/stop` | POST | Stop movement |
 | `/bot/break` | POST | Break block at position |
 | `/bot/place` | POST | Place block at position |
+| `/bot/interact` | POST | Interact with block (doors, gates, levers, etc.) |
 | `/bot/pathfind` | POST | Calculate path using VS AStar (returns waypoints) |
 | `/bot/movement/status` | GET | Get current movement status (for async polling) |
 | `/bot/inventory` | GET | Get inventory contents (slots + hand items) |
@@ -836,6 +837,7 @@ agent.RightHandItemSlot
 | `bot_collect` | Pick up loose item block at position |
 | `bot_pickup` | Pick up dropped item entity |
 | `bot_inventory_drop` | Drop item from inventory |
+| `bot_interact` | Interact with block (doors, gates, levers) |
 
 ### Typical Workflow
 
@@ -851,6 +853,84 @@ agent.RightHandItemSlot
 - [Entity Behaviors](https://wiki.vintagestory.at/Modding:Entity_Behaviors)
 - [EntityAgent API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.EntityAgent.html)
 - [Basic Inventory Handling](https://wiki.vintagestory.at/Modding:Basic_Inventory_Handling)
+
+## Bot Block Interaction - IMPLEMENTED!
+
+### Overview
+
+The bot can now interact with activatable blocks like doors, gates, trapdoors, and levers using the `block.Activate()` API.
+
+### API Endpoint
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/bot/interact` | POST | Interact with a block (simulate right-click) |
+
+### /bot/interact Request/Response
+
+**Request:**
+```json
+{ "x": 512100, "y": 120, "z": 511850 }
+```
+
+**Request (relative coordinates):**
+```json
+{ "x": 1, "y": 0, "z": 0, "relative": true }
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "message": "Activated block game:door-plank-north",
+    "block": "game:door-plank-north",
+    "position": { "x": 512100, "y": 120, "z": 511850 }
+}
+```
+
+### MCP Tool
+
+| Tool | Description |
+|------|-------------|
+| `bot_interact` | Interact with a block at specified position |
+
+### How It Works
+
+Uses VS `Block.Activate()` API with:
+- `Caller` - Identifies the bot entity as the one interacting
+- `BlockSelection` - Target block position and face
+- `TreeAttribute` - Optional activation parameters
+
+**Key code pattern (from DanaTweaks mod):**
+```csharp
+block.Activate(world, new Caller() { Entity = entity }, blockSel, new TreeAttribute());
+```
+
+### Supported Block Types
+
+| Block Type | Behavior |
+|------------|----------|
+| Doors | Open/close |
+| Fence gates | Open/close |
+| Trapdoors | Open/close |
+| Levers | Toggle state |
+| Buttons | Activate |
+| Hatches | Open/close |
+
+### Usage Notes
+
+1. **Distance:** Bot should be near the target block (within 5 blocks recommended)
+2. **Block face:** Currently defaults to NORTH; may need enhancement for face-specific blocks
+3. **Locked doors:** Does not check for reinforced/locked doors; those will silently fail
+4. **Double doors:** May need to activate both halves separately
+
+### Typical Workflow
+
+1. Scan for doors: `bot_blocks` with filter "door"
+2. Move near door: `bot_goto` to adjacent position
+3. Open door: `bot_interact` with door coordinates
+4. Walk through: `bot_goto` to other side
+5. Close door: `bot_interact` again
 
 ## Bot Hunger/Satiety (Future Enhancement)
 

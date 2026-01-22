@@ -7,6 +7,7 @@ Provides tools for LLMs to control an AI bot in Vintage Story.
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,7 @@ from vintage_story_core import get_visible_surface_blocks
 
 # Configuration
 VS_API_BASE_URL = "http://localhost:4560"
+BOT_NAME = os.environ.get("VSAI_BOT_NAME", "Claude")
 MOVEMENT_POLL_INTERVAL_SEC = 0.1
 MOVEMENT_TIMEOUT_SEC = 600  # 10 minutes - complex terrain needs long winding paths
 
@@ -234,6 +236,20 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="bot_interact",
+            description="Interact with a block (open/close doors, gates, trapdoors, activate levers, etc.). Simulates right-click on the block.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Block X coordinate"},
+                    "y": {"type": "integer", "description": "Block Y coordinate"},
+                    "z": {"type": "integer", "description": "Block Z coordinate"},
+                    "relative": {"type": "boolean", "description": "If true, coordinates are relative to bot position", "default": False}
+                },
+                "required": ["x", "y", "z"]
+            }
+        ),
+        Tool(
             name="players_list",
             description="Get a list of all online players.",
             inputSchema={
@@ -260,7 +276,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "message": {"type": "string", "description": "The message to send"},
-                    "name": {"type": "string", "description": "Bot name to display (default: 'Bot')", "default": "Bot"}
+                    "name": {"type": "string", "description": f"Bot name to display (default: '{BOT_NAME}')", "default": BOT_NAME}
                 },
                 "required": ["message"]
             }
@@ -275,7 +291,7 @@ async def list_tools() -> list[Tool]:
                     "x": {"type": "number", "description": "Absolute X coordinate"},
                     "y": {"type": "number", "description": "Y coordinate (unchanged)"},
                     "z": {"type": "number", "description": "Absolute Z coordinate"},
-                    "name": {"type": "string", "description": "Bot name to display (default: 'Bot')", "default": "Bot"}
+                    "name": {"type": "string", "description": f"Bot name to display (default: '{BOT_NAME}')", "default": BOT_NAME}
                 },
                 "required": ["message", "x", "y", "z"]
             }
@@ -332,6 +348,18 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "entityId": {"type": "integer", "description": "Specific item entity ID to pick up (from bot_entities)"},
                     "maxDistance": {"type": "number", "description": "Maximum pickup distance (default: 5)", "default": 5}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="bot_inbox",
+            description=f"Read messages sent to the bot by players. Players address the bot with '{BOT_NAME}: <message>' in chat.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "clear": {"type": "boolean", "description": "Clear inbox after reading (default: true)", "default": True},
+                    "limit": {"type": "integer", "description": "Max messages to return (default: 50)", "default": 50}
                 },
                 "required": []
             }
@@ -500,6 +528,14 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "blockCode": arguments["blockCode"]
         })
 
+    elif name == "bot_interact":
+        return http_post("/bot/interact", {
+            "x": arguments["x"],
+            "y": arguments["y"],
+            "z": arguments["z"],
+            "relative": arguments.get("relative", False)
+        })
+
     elif name == "players_list":
         return http_get("/players")
 
@@ -510,7 +546,7 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     elif name == "bot_chat":
         return http_post("/bot/chat", {
             "message": arguments["message"],
-            "name": arguments.get("name", "Bot")
+            "name": arguments.get("name", BOT_NAME)
         })
 
     elif name == "bot_chat_location":
@@ -524,8 +560,14 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
         return http_post("/bot/chat", {
             "message": full_message,
-            "name": arguments.get("name", "Bot")
+            "name": arguments.get("name", BOT_NAME)
         })
+
+    elif name == "bot_inbox":
+        clear = arguments.get("clear", True)
+        limit = arguments.get("limit", 50)
+        params = f"?limit={limit}&clear={'true' if clear else 'false'}"
+        return http_get(f"/bot/inbox{params}")
 
     elif name == "screenshot":
         return http_post("/screenshot", {})

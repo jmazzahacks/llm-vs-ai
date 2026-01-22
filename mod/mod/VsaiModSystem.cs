@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
+using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.Essentials;
@@ -40,6 +41,19 @@ public class VsaiModSystem : ModSystem
     private const int ChunkLoadRadius = 3;  // Load 7x7 chunks (3 in each direction from center)
     private const int ChunkSize = 32;  // VS chunk size in blocks
 
+    // Chat inbox for player messages
+    private string _botName = "Claude";
+    private readonly Queue<ChatMessage> _chatInbox = new Queue<ChatMessage>();
+    private const int MaxInboxSize = 100;
+    private readonly object _inboxLock = new object();
+
+    private class ChatMessage
+    {
+        public long Timestamp { get; set; }
+        public string PlayerName { get; set; } = "";
+        public string Content { get; set; } = "";
+    }
+
     private const int DefaultPort = 4560;
     private const string DefaultHost = "localhost";
 
@@ -66,11 +80,22 @@ public class VsaiModSystem : ModSystem
         _serverApi = api;
         _serverApi.Logger.Notification("[VSAI] Starting Vintage Story AI Bridge...");
 
+        // Load bot name from environment variable
+        var envBotName = Environment.GetEnvironmentVariable("VSAI_BOT_NAME");
+        if (!string.IsNullOrEmpty(envBotName))
+        {
+            _botName = envBotName;
+        }
+        _serverApi.Logger.Notification($"[VSAI] Bot name: {_botName}");
+
         // Initialize pathfinding
         _astar = new AStar(api);
 
         // Register entity death handler to track bot deaths
         api.Event.OnEntityDeath += OnEntityDeath;
+
+        // Register player chat handler for inbox
+        api.Event.PlayerChat += OnPlayerChat;
 
         // Register tick listener for chunk loading (every 500ms)
         _chunkTickListenerId = api.Event.RegisterGameTickListener(OnChunkTickUpdate, 500);
@@ -344,6 +369,18 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/interact":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotInteract(request);
+                    }
+                    break;
+
                 case "/bot/stop":
                     if (method != "POST")
                     {
@@ -448,6 +485,10 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/inbox":
+                    responseBody = HandleBotInbox(request);
+                    break;
+
                 case "/screenshot":
                     if (method != "POST")
                     {
@@ -506,17 +547,28 @@ public class VsaiModSystem : ModSystem
         var players = _serverApi?.World?.AllOnlinePlayers ?? Array.Empty<IPlayer>();
         bool botActive = _botEntity != null && _botEntity.Alive;
 
+        int pendingMessages;
+        lock (_inboxLock)
+        {
+            pendingMessages = _chatInbox.Count;
+        }
+
         return JsonSerializer.Serialize(new
         {
             status = "ok",
             mod = "vsai",
             version = "0.2.0",
+            botName = _botName,
             playerCount = players.Length,
             players = GetPlayerNames(players),
             bot = new
             {
                 active = botActive,
                 entityId = botActive ? _botEntityId : 0
+            },
+            inbox = new
+            {
+                pendingCount = pendingMessages
             }
         });
     }
@@ -777,6 +829,56 @@ public class VsaiModSystem : ModSystem
 
         // Unload force-loaded chunks when bot dies
         ClearChunkTrackingState();
+    }
+
+    /// <summary>
+    /// Called when any player sends a chat message. Checks if message is addressed to the bot.
+    /// </summary>
+    private void OnPlayerChat(IServerPlayer byPlayer, int channelId, ref string message, ref string data, BoolRef consumed)
+    {
+        if (string.IsNullOrEmpty(message)) return;
+
+        // Strip HTML player name prefix: "<strong>PlayerName:</strong> actual message"
+        string actualMessage = message;
+        string playerPrefix = $"<strong>{byPlayer.PlayerName}:</strong> ";
+        if (message.StartsWith(playerPrefix))
+        {
+            actualMessage = message.Substring(playerPrefix.Length);
+        }
+
+        string lowerMessage = actualMessage.ToLower();
+        string lowerBotName = _botName.ToLower();
+        string? content = null;
+
+        // Check "BotName:" or "BotName," prefix
+        if (lowerMessage.StartsWith($"{lowerBotName}:") || lowerMessage.StartsWith($"{lowerBotName},"))
+        {
+            content = actualMessage.Substring(_botName.Length + 1).Trim();
+        }
+        // Check "@BotName " prefix
+        else if (lowerMessage.StartsWith($"@{lowerBotName} "))
+        {
+            content = actualMessage.Substring(_botName.Length + 2).Trim();
+        }
+
+        if (!string.IsNullOrEmpty(content))
+        {
+            lock (_inboxLock)
+            {
+                _chatInbox.Enqueue(new ChatMessage
+                {
+                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    PlayerName = byPlayer.PlayerName,
+                    Content = content
+                });
+                while (_chatInbox.Count > MaxInboxSize)
+                {
+                    _chatInbox.Dequeue();
+                }
+            }
+            _serverApi?.Logger.Debug($"[VSAI] Inbox from {byPlayer.PlayerName}: {content}");
+        }
+        // Don't consume - message still appears in chat
     }
 
     /// <summary>
@@ -1219,6 +1321,129 @@ public class VsaiModSystem : ModSystem
             {
                 success = true,
                 placedBlock = blockCode,
+                position = new { x, y, z }
+            });
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+    }
+
+    private string HandleBotInteract(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide x, y, z coordinates.");
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            int x, y, z;
+
+            // Support relative coordinates from bot position
+            if (root.TryGetProperty("relative", out var relative) && relative.GetBoolean())
+            {
+                var botBlockPos = _botEntity.ServerPos.AsBlockPos;
+                int dx = root.TryGetProperty("x", out var dxEl) ? dxEl.GetInt32() : 0;
+                int dy = root.TryGetProperty("y", out var dyEl) ? dyEl.GetInt32() : 0;
+                int dz = root.TryGetProperty("z", out var dzEl) ? dzEl.GetInt32() : 0;
+
+                x = botBlockPos.X + dx;
+                y = botBlockPos.Y + dy;
+                z = botBlockPos.Z + dz;
+            }
+            else
+            {
+                if (!root.TryGetProperty("x", out var xEl) ||
+                    !root.TryGetProperty("y", out var yEl) ||
+                    !root.TryGetProperty("z", out var zEl))
+                {
+                    return JsonError("Missing x, y, or z coordinates");
+                }
+
+                x = xEl.GetInt32();
+                y = yEl.GetInt32();
+                z = zEl.GetInt32();
+            }
+
+            var blockAccessor = _serverApi?.World?.BlockAccessor;
+            if (blockAccessor == null)
+            {
+                return JsonError("World not available");
+            }
+
+            var blockPos = new BlockPos(x, y, z, _botEntity.ServerPos.Dimension);
+            var block = blockAccessor.GetBlock(blockPos);
+
+            if (block == null || block.Code?.Path == "air")
+            {
+                return JsonError($"No block at position ({x}, {y}, {z})");
+            }
+
+            string blockCode = block.Code?.ToString() ?? "unknown";
+            string? resultMsg = null;
+            string? errorMsg = null;
+            var waitHandle = new ManualResetEventSlim(false);
+
+            _serverApi?.Event.EnqueueMainThreadTask(() =>
+            {
+                try
+                {
+                    // Create BlockSelection for the interaction
+                    var blockSel = new BlockSelection
+                    {
+                        Position = blockPos,
+                        Face = BlockFacing.NORTH  // Default face
+                    };
+
+                    // Create Caller with bot entity
+                    var caller = new Caller
+                    {
+                        Entity = _botEntity
+                    };
+
+                    // Create activation parameters (for doors, pass "opened" = true)
+                    var activationArgs = new TreeAttribute();
+
+                    // Activate the block
+                    block.Activate(_serverApi.World, caller, blockSel, activationArgs);
+
+                    resultMsg = $"Activated block {blockCode}";
+                    _serverApi.Logger.Notification($"[VSAI] Bot interacted with {blockCode} at ({x}, {y}, {z})");
+                }
+                catch (Exception ex)
+                {
+                    errorMsg = ex.Message;
+                    _serverApi.Logger.Error($"[VSAI] Interact error: {ex.Message}");
+                }
+                finally
+                {
+                    waitHandle.Set();
+                }
+            }, "VSAI-InteractBlock");
+
+            waitHandle.Wait(2000);
+
+            if (errorMsg != null)
+            {
+                return JsonError(errorMsg);
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                message = resultMsg,
+                block = blockCode,
                 position = new { x, y, z }
             });
         }
@@ -1724,11 +1949,11 @@ public class VsaiModSystem : ModSystem
                 return JsonError("Message cannot be empty");
             }
 
-            // Optional bot name prefix (default: "Bot")
-            string botName = "Bot";
+            // Optional bot name prefix (default: _botName)
+            string botName = _botName;
             if (root.TryGetProperty("name", out var nameEl))
             {
-                botName = nameEl.GetString() ?? "Bot";
+                botName = nameEl.GetString() ?? _botName;
             }
 
             // Format the message with bot name in color
@@ -2298,6 +2523,37 @@ public class VsaiModSystem : ModSystem
             success = true,
             entityId = targetEntity.EntityId,
             pickedUpItem = pickedUpItem
+        });
+    }
+
+    private string HandleBotInbox(HttpListenerRequest request)
+    {
+        // Parse query parameters
+        bool clear = request.QueryString["clear"]?.ToLower() != "false";  // default true
+        int limit = 50;
+        if (int.TryParse(request.QueryString["limit"], out int parsedLimit))
+        {
+            limit = Math.Clamp(parsedLimit, 1, 100);
+        }
+
+        List<object> messages;
+        lock (_inboxLock)
+        {
+            messages = _chatInbox.Take(limit)
+                .Select(m => (object)new { timestamp = m.Timestamp, player = m.PlayerName, message = m.Content })
+                .ToList();
+            if (clear)
+            {
+                _chatInbox.Clear();
+            }
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            botName = _botName,
+            messageCount = messages.Count,
+            messages = messages
         });
     }
 
