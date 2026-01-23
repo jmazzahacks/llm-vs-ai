@@ -475,6 +475,30 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/craft":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotCraft(request);
+                    }
+                    break;
+
+                case "/bot/equip":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotEquip(request);
+                    }
+                    break;
+
                 case "/screenshot":
                     if (method != "POST")
                     {
@@ -2796,6 +2820,436 @@ public class VsaiModSystem : ModSystem
             success = true,
             recipe = recipeName,
             output = craftedItem
+        });
+    }
+
+    private string HandleBotCraft(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+        if (inventoryBehavior == null)
+        {
+            return JsonError("Bot has no inventory behavior configured");
+        }
+
+        var inventory = inventoryBehavior.Inventory;
+        if (inventory == null)
+        {
+            return JsonError("Bot inventory is null");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide 'recipe' parameter (e.g., 'axe', 'knife', 'shovel', 'spear').");
+        }
+
+        string? recipeName = null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("recipe", out var recipeEl))
+            {
+                return JsonError("Missing 'recipe' parameter.");
+            }
+
+            recipeName = recipeEl.GetString()?.ToLowerInvariant();
+            if (string.IsNullOrEmpty(recipeName))
+            {
+                return JsonError("Recipe name cannot be empty");
+            }
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+
+        // Get all grid recipes
+        var gridRecipes = _serverApi?.World?.GridRecipes;
+        if (gridRecipes == null || gridRecipes.Count == 0)
+        {
+            return JsonError("No grid recipes available");
+        }
+
+        // Collect inventory items
+        var inventoryItems = new List<(int slotIndex, ItemSlot slot)>();
+        for (int i = 0; i < inventory.Count; i++)
+        {
+            var slot = inventory[i];
+            if (slot?.Itemstack?.Collectible != null)
+            {
+                inventoryItems.Add((i, slot));
+            }
+        }
+
+        // Find matching recipe by output name AND available ingredients
+        GridRecipe? matchingRecipe = null;
+        var ingredientSlots = new List<(int slotIndex, CraftingRecipeIngredient ingredient)>();
+
+        foreach (var recipe in gridRecipes)
+        {
+            if (recipe?.Output?.ResolvedItemstack?.Collectible == null) continue;
+
+            var outputCode = recipe.Output.ResolvedItemstack.Collectible.Code?.Path?.ToLowerInvariant() ?? "";
+
+            // Match by output containing the recipe name (e.g., "axe-flint" contains "axe")
+            if (!outputCode.Contains(recipeName)) continue;
+
+            // Get required ingredients from this recipe
+            var requiredIngredients = new List<CraftingRecipeIngredient>();
+            if (recipe.resolvedIngredients != null)
+            {
+                foreach (var ing in recipe.resolvedIngredients)
+                {
+                    if (ing != null)
+                    {
+                        requiredIngredients.Add(ing);
+                    }
+                }
+            }
+
+            if (requiredIngredients.Count == 0) continue;
+
+            // Check if we have all ingredients in inventory
+            var tempSlots = new List<(int slotIndex, CraftingRecipeIngredient ingredient)>();
+            var usedSlotIndices = new HashSet<int>();
+            bool hasAllIngredients = true;
+
+            foreach (var reqIng in requiredIngredients)
+            {
+                bool foundMatch = false;
+                foreach (var (slotIdx, slot) in inventoryItems)
+                {
+                    if (usedSlotIndices.Contains(slotIdx)) continue;
+                    if (slot.Itemstack == null) continue;
+
+                    if (reqIng.SatisfiesAsIngredient(slot.Itemstack))
+                    {
+                        tempSlots.Add((slotIdx, reqIng));
+                        usedSlotIndices.Add(slotIdx);
+                        foundMatch = true;
+                        break;
+                    }
+                }
+
+                if (!foundMatch)
+                {
+                    hasAllIngredients = false;
+                    break;
+                }
+            }
+
+            if (hasAllIngredients)
+            {
+                matchingRecipe = recipe;
+                ingredientSlots = tempSlots;
+                break;
+            }
+        }
+
+        if (matchingRecipe == null)
+        {
+            // List available recipes matching the name for error message
+            var available = new List<string>();
+            foreach (var recipe in gridRecipes)
+            {
+                var outputCode = recipe?.Output?.ResolvedItemstack?.Collectible?.Code?.Path?.ToLowerInvariant() ?? "";
+                if (outputCode.Contains(recipeName))
+                {
+                    var ingredients = new List<string>();
+                    if (recipe?.resolvedIngredients != null)
+                    {
+                        foreach (var ing in recipe.resolvedIngredients)
+                        {
+                            if (ing?.Code != null)
+                            {
+                                ingredients.Add(ing.Code.Path);
+                            }
+                        }
+                    }
+                    available.Add($"{outputCode} (needs {string.Join(" + ", ingredients)})");
+                }
+            }
+            if (available.Count > 0)
+            {
+                return JsonError($"Found {available.Count} '{recipeName}' recipes but missing ingredients: {string.Join(", ", available.Take(5))}");
+            }
+            return JsonError($"No grid recipe found matching '{recipeName}'.");
+        }
+
+        // Execute crafting on main thread
+        object? craftedItem = null;
+        string? errorMsg = null;
+        var waitHandle = new ManualResetEventSlim(false);
+
+        _serverApi?.Event.EnqueueMainThreadTask(() =>
+        {
+            try
+            {
+                // Consume ingredients
+                foreach (var (slotIdx, ingredient) in ingredientSlots)
+                {
+                    var slot = inventory[slotIdx];
+                    if (slot?.Itemstack != null)
+                    {
+                        int consumeQty = ingredient.Quantity;
+                        slot.Itemstack.StackSize -= consumeQty;
+                        if (slot.Itemstack.StackSize <= 0)
+                        {
+                            slot.Itemstack = null;
+                        }
+                        slot.MarkDirty();
+                    }
+                }
+
+                // Create output
+                var outputStack = matchingRecipe.Output.ResolvedItemstack.Clone();
+                outputStack.StackSize = matchingRecipe.Output.Quantity;
+
+                // Give output to bot
+                agent.TryGiveItemStack(outputStack);
+                bool actuallyAdded = outputStack.StackSize == 0;
+
+                // Manual slot insertion fallback
+                if (!actuallyAdded)
+                {
+                    for (int slotIdx = 0; slotIdx < inventory.Count; slotIdx++)
+                    {
+                        var slot = inventory[slotIdx];
+                        if (slot?.Itemstack == null)
+                        {
+                            slot.Itemstack = outputStack.Clone();
+                            slot.MarkDirty();
+                            outputStack.StackSize = 0;
+                            actuallyAdded = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!actuallyAdded)
+                {
+                    // Drop at bot's feet if inventory is full
+                    _serverApi.World.SpawnItemEntity(outputStack, _botEntity.ServerPos.XYZ);
+                }
+
+                craftedItem = new
+                {
+                    code = matchingRecipe.Output.ResolvedItemstack.Collectible?.Code?.ToString() ?? "unknown",
+                    quantity = matchingRecipe.Output.Quantity,
+                    name = matchingRecipe.Output.ResolvedItemstack.GetName(),
+                    addedToInventory = actuallyAdded
+                };
+            }
+            catch (Exception ex)
+            {
+                errorMsg = $"Crafting failed: {ex.Message}";
+            }
+            finally
+            {
+                waitHandle.Set();
+            }
+        }, "VSAI-Craft");
+
+        waitHandle.Wait(5000);
+
+        if (errorMsg != null)
+        {
+            return JsonError(errorMsg);
+        }
+
+        if (craftedItem == null)
+        {
+            return JsonError("Crafting produced no output");
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            recipe = recipeName,
+            output = craftedItem
+        });
+    }
+
+    private string HandleBotEquip(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+        if (inventoryBehavior == null)
+        {
+            return JsonError("Bot has no inventory behavior configured");
+        }
+
+        var inventory = inventoryBehavior.Inventory;
+        if (inventory == null)
+        {
+            return JsonError("Bot inventory is null");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide 'slotIndex' or 'itemCode', and optionally 'hand' (right/left).");
+        }
+
+        int? slotIndex = null;
+        string? itemCode = null;
+        string hand = "right";
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("slotIndex", out var slotEl))
+            {
+                slotIndex = slotEl.GetInt32();
+            }
+
+            if (root.TryGetProperty("itemCode", out var codeEl))
+            {
+                itemCode = codeEl.GetString()?.ToLowerInvariant();
+            }
+
+            if (root.TryGetProperty("hand", out var handEl))
+            {
+                hand = handEl.GetString()?.ToLowerInvariant() ?? "right";
+            }
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+
+        if (slotIndex == null && string.IsNullOrEmpty(itemCode))
+        {
+            return JsonError("Must provide either 'slotIndex' or 'itemCode'");
+        }
+
+        // Find the source slot
+        ItemSlot? sourceSlot = null;
+        int foundSlotIndex = -1;
+
+        if (slotIndex != null)
+        {
+            if (slotIndex < 0 || slotIndex >= inventory.Count)
+            {
+                return JsonError($"Invalid slot index {slotIndex}. Valid range: 0-{inventory.Count - 1}");
+            }
+            sourceSlot = inventory[slotIndex.Value];
+            foundSlotIndex = slotIndex.Value;
+        }
+        else if (!string.IsNullOrEmpty(itemCode))
+        {
+            // Search inventory for matching item
+            for (int i = 0; i < inventory.Count; i++)
+            {
+                var slot = inventory[i];
+                if (slot?.Itemstack?.Collectible != null)
+                {
+                    var code = slot.Itemstack.Collectible.Code?.ToString()?.ToLowerInvariant() ?? "";
+                    if (code.Contains(itemCode))
+                    {
+                        sourceSlot = slot;
+                        foundSlotIndex = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (sourceSlot == null || sourceSlot.Itemstack == null)
+        {
+            return JsonError($"No item found matching criteria");
+        }
+
+        // Get the target hand slot
+        ItemSlot targetSlot = hand == "left" ? agent.LeftHandItemSlot : agent.RightHandItemSlot;
+
+        if (targetSlot == null)
+        {
+            return JsonError($"Bot has no {hand} hand slot");
+        }
+
+        // Execute equip on main thread
+        object? equippedItem = null;
+        string? errorMsg = null;
+        var waitHandle = new ManualResetEventSlim(false);
+
+        _serverApi?.Event.EnqueueMainThreadTask(() =>
+        {
+            try
+            {
+                // Store what we're equipping
+                var itemToEquip = sourceSlot.Itemstack.Clone();
+
+                // Swap: put hand item (if any) into inventory slot, put inventory item into hand
+                var previousHandItem = targetSlot.Itemstack?.Clone();
+
+                // Move item to hand
+                targetSlot.Itemstack = itemToEquip;
+                targetSlot.MarkDirty();
+
+                // Put previous hand item (if any) back in inventory slot
+                sourceSlot.Itemstack = previousHandItem;
+                sourceSlot.MarkDirty();
+
+                equippedItem = new
+                {
+                    code = itemToEquip.Collectible?.Code?.ToString() ?? "unknown",
+                    quantity = itemToEquip.StackSize,
+                    name = itemToEquip.GetName(),
+                    hand = hand,
+                    fromSlot = foundSlotIndex
+                };
+            }
+            catch (Exception ex)
+            {
+                errorMsg = $"Equip failed: {ex.Message}";
+            }
+            finally
+            {
+                waitHandle.Set();
+            }
+        }, "VSAI-Equip");
+
+        waitHandle.Wait(5000);
+
+        if (errorMsg != null)
+        {
+            return JsonError(errorMsg);
+        }
+
+        if (equippedItem == null)
+        {
+            return JsonError("Equip produced no result");
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            equipped = equippedItem
         });
     }
 

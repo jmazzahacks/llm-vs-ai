@@ -422,6 +422,8 @@ The target Y must be at actual ground level (where the bot can stand). If target
 | `/bot/pickup` | POST | Pick up dropped item entity (nearest or by ID) |
 | `/bot/inventory/drop` | POST | Drop item from inventory to world |
 | `/bot/knap` | POST | Knap flint/stone tool (axe, knife, shovel, etc.) |
+| `/bot/craft` | POST | Grid craft by output name (e.g., axe from head + stick) |
+| `/bot/equip` | POST | Equip item from inventory to hand (by slotIndex or itemCode) |
 | `/screenshot` | POST | Take screenshot (macOS, requires Screen Recording permission) |
 
 ### Movement Status Endpoint
@@ -1061,15 +1063,27 @@ Similar pattern with `BlockEntityClayForm` and `BlockEntityAnvil` - same voxel g
 
 ### Implementation Plan for Bot Crafting
 
-**Phase 1: Grid Crafting** (TODO)
-```csharp
-// Endpoint: /bot/craft
-// 1. Create virtual ItemSlots from bot inventory
-// 2. Iterate through api.World.GridRecipes
-// 3. Find recipe where Matches() returns true
-// 4. Call ConsumeInput() and GenerateOutputStack()
-// 5. Add output to bot inventory
+**Phase 1: Grid Crafting** - IMPLEMENTED!
+
+The `/bot/craft` endpoint allows the bot to craft items using grid recipes:
+
+```bash
+# Craft a flint axe (bot must have axe head + stick in inventory)
+curl -X POST http://localhost:4560/bot/craft \
+  -H "Content-Type: application/json" \
+  -d '{"recipe": "axe"}'
 ```
+
+**Implementation approach:**
+1. Get all recipes via `_serverApi.World.GridRecipes`
+2. Find matching recipe by output name (e.g., "axe" matches "axe-flint")
+3. Get required ingredients from `recipe.resolvedIngredients`
+4. Check bot inventory for ALL required ingredients using `SatisfiesAsIngredient()`
+5. Consume ingredients from inventory
+6. Create output itemstack from `recipe.Output.ResolvedItemstack`
+7. Give to bot via `TryGiveItemStack()` (drops if inventory full)
+
+**MCP Tool:** `bot_craft(recipe="axe")` - Works for combining tool heads with sticks, etc.
 
 **Phase 2: Knapping** - IMPLEMENTED & TESTED!
 
@@ -1137,8 +1151,9 @@ Same pattern as knapping with respective BlockEntity classes.
 | Endpoint | Method | Status | Description |
 |----------|--------|--------|-------------|
 | `/bot/knap` | POST | **DONE** | Knap flint/stone tool from inventory material |
+| `/bot/craft` | POST | **DONE** | Grid craft by output name (e.g., combine head + stick) |
+| `/bot/equip` | POST | **DONE** | Equip item from inventory to hand slot |
 | `/bot/recipes` | GET | TODO | List available grid recipes bot can craft |
-| `/bot/craft` | POST | TODO | Craft item by recipe name/output |
 | `/bot/cancraft` | GET | TODO | Check if bot has materials for recipe |
 | `/bot/clayform` | POST | TODO | Complete clay forming at position |
 | `/bot/smith` | POST | TODO | Complete smithing at position |

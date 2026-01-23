@@ -377,6 +377,43 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["recipe"]
             }
+        ),
+        Tool(
+            name="bot_craft",
+            description="Craft an item using grid recipe. Bot must have all required ingredients in inventory. Use for combining knapped tool heads with sticks to make tools.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "recipe": {
+                        "type": "string",
+                        "description": "Output to craft (e.g., 'axe', 'knife', 'shovel', 'spear'). Matches recipes containing this name."
+                    }
+                },
+                "required": ["recipe"]
+            }
+        ),
+        Tool(
+            name="bot_equip",
+            description="Equip an item from inventory to the bot's hand. Swaps with any item currently in hand.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "slotIndex": {
+                        "type": "integer",
+                        "description": "Inventory slot index to equip from (0-based)"
+                    },
+                    "itemCode": {
+                        "type": "string",
+                        "description": "Item code to search for and equip (alternative to slotIndex, e.g., 'knife', 'axe')"
+                    },
+                    "hand": {
+                        "type": "string",
+                        "description": "Which hand to equip to: 'right' (default) or 'left'",
+                        "default": "right"
+                    }
+                },
+                "required": []
+            }
         )
     ]
 
@@ -618,6 +655,21 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return http_post("/bot/knap", {
             "recipe": arguments["recipe"]
         })
+
+    elif name == "bot_craft":
+        return http_post("/bot/craft", {
+            "recipe": arguments["recipe"]
+        })
+
+    elif name == "bot_equip":
+        data: dict[str, Any] = {}
+        if "slotIndex" in arguments:
+            data["slotIndex"] = arguments["slotIndex"]
+        if "itemCode" in arguments:
+            data["itemCode"] = arguments["itemCode"]
+        if "hand" in arguments:
+            data["hand"] = arguments["hand"]
+        return http_post("/bot/equip", data)
 
     else:
         return {"error": f"Unknown tool: {name}"}
