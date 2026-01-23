@@ -39,6 +39,30 @@ public class EntityAiBot : EntityAgent
     public override bool AllowOutsideLoadedRange => true;
 
     /// <summary>
+    /// Right hand item slot - returns slot from botinventory behavior.
+    /// </summary>
+    public override ItemSlot RightHandItemSlot
+    {
+        get
+        {
+            var inventoryBehavior = GetBehavior<EntityBehaviorBotInventory>();
+            return inventoryBehavior?.RightHandSlot!;
+        }
+    }
+
+    /// <summary>
+    /// Left hand item slot - returns slot from botinventory behavior.
+    /// </summary>
+    public override ItemSlot LeftHandItemSlot
+    {
+        get
+        {
+            var inventoryBehavior = GetBehavior<EntityBehaviorBotInventory>();
+            return inventoryBehavior?.LeftHandSlot!;
+        }
+    }
+
+    /// <summary>
     /// Initialize the entity with extended simulation range.
     /// Default SimulationRange is 128 blocks - we extend to 1000 to allow
     /// the bot to move autonomously at greater distances from the player.
