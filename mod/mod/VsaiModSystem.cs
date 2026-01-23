@@ -30,9 +30,6 @@ public class VsaiModSystem : ModSystem
     private Entity? _botEntity;
     private long _botEntityId;
 
-    // Pathfinding
-    private AStar? _astar;
-
     // Chunk loading to prevent bot despawning at long distances
     private HashSet<long> _forceLoadedChunks = new HashSet<long>();
     private int _lastBotChunkX = int.MinValue;
@@ -73,6 +70,10 @@ public class VsaiModSystem : ModSystem
         // Register our custom entity class (prevents persistence to save file)
         api.RegisterEntity("vsai.EntityAiBot", typeof(EntityAiBot));
         api.Logger.Notification("[VSAI] Registered entity class: vsai.EntityAiBot");
+
+        // Register our custom inventory behavior with expanded slot count
+        api.RegisterEntityBehaviorClass("botinventory", typeof(EntityBehaviorBotInventory));
+        api.Logger.Notification("[VSAI] Registered entity behavior: botinventory");
     }
 
     public override void StartServerSide(ICoreServerAPI api)
@@ -87,9 +88,6 @@ public class VsaiModSystem : ModSystem
             _botName = envBotName;
         }
         _serverApi.Logger.Notification($"[VSAI] Bot name: {_botName}");
-
-        // Initialize pathfinding
-        _astar = new AStar(api);
 
         // Register entity death handler to track bot deaths
         api.Event.OnEntityDeath += OnEntityDeath;
@@ -405,32 +403,8 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
-                case "/bot/walk":
-                    if (method != "POST")
-                    {
-                        statusCode = 405;
-                        responseBody = JsonError("Method not allowed. Use POST.");
-                    }
-                    else
-                    {
-                        responseBody = HandleBotWalk(request);
-                    }
-                    break;
-
                 case "/bot/movement/status":
                     responseBody = HandleBotMovementStatus();
-                    break;
-
-                case "/bot/pathfind":
-                    if (method != "POST")
-                    {
-                        statusCode = 405;
-                        responseBody = JsonError("Method not allowed. Use POST.");
-                    }
-                    else
-                    {
-                        responseBody = HandleBotPathfind(request);
-                    }
                     break;
 
                 case "/bot/chat":
@@ -487,6 +461,18 @@ public class VsaiModSystem : ModSystem
 
                 case "/bot/inbox":
                     responseBody = HandleBotInbox(request);
+                    break;
+
+                case "/bot/knap":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotKnap(request);
+                    }
                     break;
 
                 case "/screenshot":
@@ -1618,119 +1604,6 @@ public class VsaiModSystem : ModSystem
         });
     }
 
-    /// <summary>
-    /// Direct walk to a target position (bypasses A* pathfinding).
-    /// Useful when pathfinding fails due to unloaded chunks.
-    /// </summary>
-    private string HandleBotWalk(HttpListenerRequest request)
-    {
-        if (_botEntity == null || !_botEntity.Alive)
-        {
-            return JsonError("No active bot");
-        }
-
-        var body = ReadRequestBody(request);
-        if (string.IsNullOrEmpty(body))
-        {
-            return JsonError("Empty request body. Provide x, y, z target coordinates.");
-        }
-
-        double targetX, targetY, targetZ;
-        float speed = 0.03f;  // Default direct walk speed (matches normal walk speed)
-
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("relative", out var relative) && relative.GetBoolean())
-            {
-                double dx = root.TryGetProperty("x", out var dxEl) ? dxEl.GetDouble() : 0;
-                double dy = root.TryGetProperty("y", out var dyEl) ? dyEl.GetDouble() : 0;
-                double dz = root.TryGetProperty("z", out var dzEl) ? dzEl.GetDouble() : 0;
-
-                targetX = _botEntity.ServerPos.X + dx;
-                targetY = _botEntity.ServerPos.Y + dy;
-                targetZ = _botEntity.ServerPos.Z + dz;
-            }
-            else
-            {
-                if (!root.TryGetProperty("x", out var xEl) ||
-                    !root.TryGetProperty("y", out var yEl) ||
-                    !root.TryGetProperty("z", out var zEl))
-                {
-                    return JsonError("Missing x, y, or z coordinates");
-                }
-
-                targetX = xEl.GetDouble();
-                targetY = yEl.GetDouble();
-                targetZ = zEl.GetDouble();
-            }
-
-            if (root.TryGetProperty("speed", out var speedEl))
-            {
-                speed = (float)speedEl.GetDouble();
-            }
-        }
-        catch (JsonException ex)
-        {
-            return JsonError($"Invalid JSON: {ex.Message}");
-        }
-
-        // Use the AI task for direct walking
-        string? errorMsg = null;
-        var waitHandle = new ManualResetEventSlim(false);
-
-        _serverApi?.Event.EnqueueMainThreadTask(() =>
-        {
-            try
-            {
-                var task = GetRemoteControlTask();
-                if (task == null)
-                {
-                    errorMsg = "RemoteControl AI task not found on entity";
-                }
-                else
-                {
-                    var targetPos = new Vec3d(targetX, targetY, targetZ);
-                    task.SetDirectWalkTarget(targetPos, speed);
-                    _serverApi.Logger.Notification($"[VSAI] Direct walk to ({targetX:F1}, {targetY:F1}, {targetZ:F1}), speed={speed}");
-                }
-            }
-            catch (Exception ex)
-            {
-                errorMsg = $"Error: {ex.Message}";
-            }
-            finally
-            {
-                waitHandle.Set();
-            }
-        }, "VSAI-WalkTask");
-
-        waitHandle.Wait(TimeSpan.FromSeconds(5));
-
-        if (errorMsg != null)
-        {
-            return JsonError(errorMsg);
-        }
-
-        var currentPos = _botEntity.ServerPos;
-        double distance = Math.Sqrt(
-            Math.Pow(targetX - currentPos.X, 2) +
-            Math.Pow(targetZ - currentPos.Z, 2)
-        );
-
-        return JsonSerializer.Serialize(new
-        {
-            success = true,
-            target = new { x = targetX, y = targetY, z = targetZ },
-            currentPosition = new { x = currentPos.X, y = currentPos.Y, z = currentPos.Z },
-            distance = Math.Round(distance, 1),
-            speed = speed,
-            note = "Direct walk bypasses A* pathfinding. Bot will walk in a straight line."
-        });
-    }
-
     private string HandleBotMovementStatus()
     {
         if (_botEntity == null || !_botEntity.Alive)
@@ -1765,163 +1638,6 @@ public class VsaiModSystem : ModSystem
             isActive = task.IsActive(),
             isDirectWalking = task.IsDirectWalking(),
             onGround = _botEntity.OnGround
-        });
-    }
-
-    private string HandleBotPathfind(HttpListenerRequest request)
-    {
-        if (_botEntity == null || !_botEntity.Alive)
-        {
-            return JsonError("No active bot");
-        }
-
-        if (_astar == null || _serverApi == null)
-        {
-            return JsonError("Pathfinding not initialized");
-        }
-
-        var body = ReadRequestBody(request);
-        if (string.IsNullOrEmpty(body))
-        {
-            return JsonError("Empty request body. Provide x, y, z target coordinates.");
-        }
-
-        double targetX, targetY, targetZ;
-        int maxFallHeight = 4;
-        float stepHeight = 1.2f;  // Must be >1.0 to handle 1-block terrain rises
-        int searchDepth = 9999;
-
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            var root = doc.RootElement;
-
-            if (root.TryGetProperty("relative", out var relative) && relative.GetBoolean())
-            {
-                double dx = root.TryGetProperty("x", out var dxEl) ? dxEl.GetDouble() : 0;
-                double dy = root.TryGetProperty("y", out var dyEl) ? dyEl.GetDouble() : 0;
-                double dz = root.TryGetProperty("z", out var dzEl) ? dzEl.GetDouble() : 0;
-
-                targetX = _botEntity.ServerPos.X + dx;
-                targetY = _botEntity.ServerPos.Y + dy;
-                targetZ = _botEntity.ServerPos.Z + dz;
-            }
-            else
-            {
-                if (!root.TryGetProperty("x", out var xEl) ||
-                    !root.TryGetProperty("y", out var yEl) ||
-                    !root.TryGetProperty("z", out var zEl))
-                {
-                    return JsonError("Missing x, y, or z coordinates");
-                }
-
-                targetX = xEl.GetDouble();
-                targetY = yEl.GetDouble();
-                targetZ = zEl.GetDouble();
-            }
-
-            if (root.TryGetProperty("maxFallHeight", out var mfh))
-                maxFallHeight = mfh.GetInt32();
-            if (root.TryGetProperty("stepHeight", out var sh))
-                stepHeight = (float)sh.GetDouble();
-            if (root.TryGetProperty("searchDepth", out var sd))
-                searchDepth = sd.GetInt32();
-        }
-        catch (JsonException ex)
-        {
-            return JsonError($"Invalid JSON: {ex.Message}");
-        }
-
-        // Pathfinder expects position where entity stands (air block), not ground block
-        var startPos = _botEntity.ServerPos.AsBlockPos;
-        var endPos = new BlockPos((int)targetX, (int)targetY, (int)targetZ, startPos.dimension);
-
-        // Get entity collision box
-        var collisionBox = _botEntity.CollisionBox ?? new Cuboidf(-0.3f, 0, -0.3f, 0.3f, 1.75f, 0.3f);
-
-        List<Vec3d>? waypoints = null;
-        string? errorMsg = null;
-        var waitHandle = new ManualResetEventSlim(false);
-
-        _serverApi.Event.EnqueueMainThreadTask(() =>
-        {
-            try
-            {
-                var startBlock = _serverApi.World.BlockAccessor.GetBlock(startPos);
-                var endBlock = _serverApi.World.BlockAccessor.GetBlock(endPos);
-                _serverApi.Logger.Notification($"[VSAI] Pathfind: start=({startPos.X},{startPos.Y},{startPos.Z}) [{startBlock?.Code}] end=({endPos.X},{endPos.Y},{endPos.Z}) [{endBlock?.Code}]");
-                waypoints = _astar.FindPathAsWaypoints(
-                    startPos,
-                    endPos,
-                    maxFallHeight,
-                    stepHeight,
-                    collisionBox,
-                    searchDepth,
-                    0,
-                    EnumAICreatureType.Humanoid
-                );
-
-                if (waypoints == null || waypoints.Count == 0)
-                {
-                    errorMsg = "No path found";
-                }
-                else
-                {
-                    _serverApi.Logger.Notification($"[VSAI] Found path with {waypoints.Count} waypoints");
-                }
-            }
-            catch (Exception ex)
-            {
-                errorMsg = $"Pathfinding error: {ex.Message}";
-                _serverApi.Logger.Error($"[VSAI] {errorMsg}");
-            }
-            finally
-            {
-                waitHandle.Set();
-            }
-        }, "VSAI-Pathfind");
-
-        waitHandle.Wait(10000); // 10 second timeout for pathfinding
-
-        if (errorMsg != null)
-        {
-            return JsonSerializer.Serialize(new
-            {
-                success = false,
-                error = errorMsg
-            });
-        }
-
-        if (waypoints == null)
-        {
-            return JsonSerializer.Serialize(new
-            {
-                success = false,
-                error = "Pathfinding timed out"
-            });
-        }
-
-        // Calculate total distance
-        double totalDistance = 0;
-        for (int i = 1; i < waypoints.Count; i++)
-        {
-            totalDistance += waypoints[i - 1].DistanceTo(waypoints[i]);
-        }
-
-        var waypointList = new List<object>();
-        foreach (var wp in waypoints)
-        {
-            waypointList.Add(new { x = wp.X, y = wp.Y, z = wp.Z });
-        }
-
-        return JsonSerializer.Serialize(new
-        {
-            success = true,
-            start = new { x = startPos.X, y = startPos.Y, z = startPos.Z },
-            target = new { x = targetX, y = targetY, z = targetZ },
-            waypointCount = waypoints.Count,
-            distance = Math.Round(totalDistance, 2),
-            waypoints = waypointList
         });
     }
 
@@ -1989,7 +1705,7 @@ public class VsaiModSystem : ModSystem
             return JsonError("Bot is not an EntityAgent");
         }
 
-        var inventoryBehavior = agent.GetBehavior<EntityBehaviorSeraphInventory>();
+        var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
         if (inventoryBehavior == null)
         {
             return JsonError("Bot has no inventory behavior configured");
@@ -2224,7 +1940,7 @@ public class VsaiModSystem : ModSystem
             return JsonError("Bot is not an EntityAgent");
         }
 
-        var inventoryBehavior = agent.GetBehavior<EntityBehaviorSeraphInventory>();
+        var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
         if (inventoryBehavior == null)
         {
             return JsonError("Bot has no inventory behavior configured");
@@ -2475,15 +2191,31 @@ public class VsaiModSystem : ModSystem
 
                 var originalSize = itemStack.StackSize;
                 var stackToGive = itemStack.Clone();
-                bool given = agent.TryGiveItemStack(stackToGive);
 
-                // Check how many were actually given (stackToGive is modified by TryGiveItemStack)
+                var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+                var inventory = inventoryBehavior?.Inventory;
+
+                bool given = agent.TryGiveItemStack(stackToGive);
                 int amountGiven = originalSize - stackToGive.StackSize;
 
-                if (given || amountGiven > 0)
+                // Manual slot insertion fallback if TryGiveItemStack fails
+                if (amountGiven == 0 && inventory != null)
                 {
-                    if (amountGiven == 0) amountGiven = originalSize; // If given is true, all were taken
+                    for (int slotIdx = 0; slotIdx < inventory.Count; slotIdx++)
+                    {
+                        var slot = inventory[slotIdx];
+                        if (slot?.Itemstack == null)
+                        {
+                            slot.Itemstack = stackToGive.Clone();
+                            slot.MarkDirty();
+                            amountGiven = originalSize;
+                            break;
+                        }
+                    }
+                }
 
+                if (amountGiven > 0)
+                {
                     pickedUpItem = new
                     {
                         code = itemStack.Collectible?.Code?.ToString() ?? "unknown",
@@ -2704,6 +2436,367 @@ public class VsaiModSystem : ModSystem
             names[i] = players[i].PlayerName;
         }
         return names;
+    }
+
+    private string HandleBotKnap(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+        if (inventoryBehavior == null)
+        {
+            return JsonError("Bot has no inventory behavior configured");
+        }
+
+        var inventory = inventoryBehavior.Inventory;
+        if (inventory == null)
+        {
+            return JsonError("Bot inventory is null");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide 'recipe' parameter (e.g., 'axe', 'knife', 'shovel', 'hoe', 'spear', 'arrowhead').");
+        }
+
+        string? recipeName = null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("recipe", out var recipeEl))
+            {
+                return JsonError("Missing 'recipe' parameter. Valid options: axe, knife, shovel, hoe, spear, arrowhead");
+            }
+
+            recipeName = recipeEl.GetString()?.ToLowerInvariant();
+            if (string.IsNullOrEmpty(recipeName))
+            {
+                return JsonError("Recipe name cannot be empty");
+            }
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+
+        // Get all knapping recipes using extension method
+        // The GetKnappingRecipes extension method is in Vintagestory.GameContent
+        var knappingRecipes = _serverApi?.World?.Api?.GetKnappingRecipes();
+
+        if (knappingRecipes == null || knappingRecipes.Count == 0)
+        {
+            // Debug: Log what we have
+            _serverApi?.Logger.Warning("[VSAI] GetKnappingRecipes returned null or empty");
+
+            // Try alternative: iterate through all recipes
+            var allRecipes = new List<KnappingRecipe>();
+
+            // Recipes might be in a grid recipe registry or other location
+            var gridRecipes = _serverApi?.World?.GridRecipes;
+            _serverApi?.Logger.Notification($"[VSAI] GridRecipes count: {gridRecipes?.Count ?? 0}");
+
+            return JsonError($"No knapping recipes available. GridRecipes: {gridRecipes?.Count ?? 0}");
+        }
+
+        // Find matching recipe by output name AND available material in inventory
+        // First, collect all inventory materials
+        var inventoryMaterials = new List<(int slotIndex, ItemSlot slot)>();
+        for (int i = 0; i < inventory.Count; i++)
+        {
+            var slot = inventory[i];
+            if (slot?.Itemstack?.Collectible != null)
+            {
+                inventoryMaterials.Add((i, slot));
+            }
+        }
+        // Also check hand slots
+        if (agent.RightHandItemSlot?.Itemstack != null)
+        {
+            inventoryMaterials.Add((-2, agent.RightHandItemSlot)); // -2 = right hand marker
+        }
+
+        // Find a recipe that matches the requested output AND has material in inventory
+        KnappingRecipe? matchingRecipe = null;
+        int materialSlotIndex = -1;
+        ItemSlot? materialSlot = null;
+
+        foreach (var recipe in knappingRecipes)
+        {
+            if (recipe?.Output?.ResolvedItemstack?.Collectible == null) continue;
+            if (recipe.Ingredient == null) continue;
+
+            var outputCode = recipe.Output.ResolvedItemstack.Collectible.Code?.Path?.ToLowerInvariant() ?? "";
+
+            // Match by output containing the recipe name (e.g., "knifeblade" contains "knife")
+            if (!outputCode.Contains(recipeName)) continue;
+
+            // Check if we have a matching ingredient in inventory
+            foreach (var (slotIdx, slot) in inventoryMaterials)
+            {
+                if (recipe.Ingredient.SatisfiesAsIngredient(slot.Itemstack))
+                {
+                    matchingRecipe = recipe;
+                    materialSlotIndex = slotIdx;
+                    materialSlot = slot;
+                    break;
+                }
+            }
+
+            if (matchingRecipe != null) break;
+        }
+
+        if (matchingRecipe == null)
+        {
+            // List available recipes for error message
+            var available = new List<string>();
+            foreach (var recipe in knappingRecipes)
+            {
+                var outputCode = recipe?.Output?.ResolvedItemstack?.Collectible?.Code?.Path;
+                if (!string.IsNullOrEmpty(outputCode) && outputCode.ToLowerInvariant().Contains(recipeName))
+                {
+                    var ingredient = recipe?.Ingredient?.Code?.Path ?? "unknown";
+                    available.Add($"{outputCode} (needs {ingredient})");
+                }
+            }
+            if (available.Count > 0)
+            {
+                return JsonError($"Found {available.Count} '{recipeName}' recipes but no matching materials in inventory: {string.Join(", ", available)}");
+            }
+            return JsonError($"No recipe found matching '{recipeName}'.");
+        }
+
+        if (materialSlot == null || materialSlot.Itemstack == null)
+        {
+            return JsonError($"No suitable material found in inventory for recipe.");
+        }
+
+        // Execute knapping on main thread
+        object? craftedItem = null;
+        string? errorMsg = null;
+        var waitHandle = new ManualResetEventSlim(false);
+
+        _serverApi?.Event.EnqueueMainThreadTask(() =>
+        {
+            try
+            {
+                var blockAccessor = _serverApi.World.BlockAccessor;
+                var world = _serverApi.World;
+
+                // Find a suitable ground position in front of bot for knapping surface
+                var botPos = _botEntity.ServerPos;
+                float yaw = botPos.Yaw;
+
+                // Calculate position 1 block in front of bot
+                int frontX = (int)Math.Floor(botPos.X - Math.Sin(yaw));
+                int frontZ = (int)Math.Floor(botPos.Z + Math.Cos(yaw));
+                int groundY = (int)Math.Floor(botPos.Y);
+
+                // Find ground level (scan down to find solid block)
+                var testPos = new BlockPos(frontX, groundY, frontZ, botPos.Dimension);
+                for (int dy = 0; dy >= -3; dy--)
+                {
+                    testPos.Y = groundY + dy;
+                    var block = blockAccessor.GetBlock(testPos);
+                    if (block != null && block.SideSolid[BlockFacing.UP.Index])
+                    {
+                        groundY = testPos.Y;
+                        break;
+                    }
+                }
+
+                // Position for knapping surface is on top of ground
+                var surfacePos = new BlockPos(frontX, groundY + 1, frontZ, botPos.Dimension);
+
+                // Get knapping surface block
+                var knappingSurfaceBlock = world.GetBlock(new AssetLocation("game:knappingsurface"));
+                if (knappingSurfaceBlock == null)
+                {
+                    errorMsg = "Knapping surface block not found in game registry";
+                    return;
+                }
+
+                // Check if position is clear
+                var existingBlock = blockAccessor.GetBlock(surfacePos);
+                if (existingBlock != null && existingBlock.Code?.Path != "air")
+                {
+                    errorMsg = $"Cannot place knapping surface - position blocked by {existingBlock.Code}";
+                    return;
+                }
+
+                // Place knapping surface block
+                blockAccessor.SetBlock(knappingSurfaceBlock.BlockId, surfacePos);
+
+                // Get the block entity
+                var blockEntity = blockAccessor.GetBlockEntity(surfacePos) as BlockEntityKnappingSurface;
+                if (blockEntity == null)
+                {
+                    // Clean up if we can't get the entity
+                    blockAccessor.SetBlock(0, surfacePos);
+                    errorMsg = "Failed to create knapping surface block entity";
+                    return;
+                }
+
+                // Take one material from inventory
+                var materialStack = materialSlot.TakeOut(1);
+                materialSlot.MarkDirty();
+
+                if (materialStack == null)
+                {
+                    blockAccessor.SetBlock(0, surfacePos);
+                    errorMsg = "Failed to take material from inventory";
+                    return;
+                }
+
+                // Set the base material on the knapping surface
+                blockEntity.BaseMaterial = materialStack;
+
+                // Find recipe index and set it
+                int recipeIndex = knappingRecipes.IndexOf(matchingRecipe);
+                if (recipeIndex < 0)
+                {
+                    blockAccessor.SetBlock(0, surfacePos);
+                    agent.TryGiveItemStack(materialStack); // Return material
+                    errorMsg = "Recipe not found in registry";
+                    return;
+                }
+
+                // Set the selected recipe using reflection if needed
+                // The selectedRecipeId field controls which recipe is active
+                var selectedRecipeField = blockEntity.GetType().GetField("selectedRecipeId",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (selectedRecipeField != null)
+                {
+                    selectedRecipeField.SetValue(blockEntity, recipeIndex);
+                }
+
+                // Initialize voxels array if needed
+                if (blockEntity.Voxels == null)
+                {
+                    blockEntity.Voxels = new bool[16, 16];
+                    for (int vx = 0; vx < 16; vx++)
+                    {
+                        for (int vz = 0; vz < 16; vz++)
+                        {
+                            blockEntity.Voxels[vx, vz] = true;
+                        }
+                    }
+                }
+
+                // Get recipe voxels - the pattern we need to create
+                // Recipe voxels are [x, layer, z] - typically layer 0
+                var recipeVoxels = matchingRecipe.Voxels;
+                if (recipeVoxels == null)
+                {
+                    blockAccessor.SetBlock(0, surfacePos);
+                    agent.TryGiveItemStack(materialStack);
+                    errorMsg = "Recipe has no voxel pattern defined";
+                    return;
+                }
+
+                // Copy recipe pattern to block entity voxels (instant completion)
+                // This is the Knapster approach - directly set voxels to match recipe
+                for (int vx = 0; vx < 16; vx++)
+                {
+                    for (int vz = 0; vz < 16; vz++)
+                    {
+                        // Recipe voxels are [x, layer, z] - we use layer 0
+                        blockEntity.Voxels[vx, vz] = recipeVoxels[vx, 0, vz];
+                    }
+                }
+
+                // Mark block entity as dirty to sync changes
+                blockEntity.MarkDirty(true);
+
+                // Create the output item
+                var outputStack = matchingRecipe.Output.ResolvedItemstack.Clone();
+                outputStack.StackSize = 1;
+
+                var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+                var inventory = inventoryBehavior?.Inventory;
+
+                // Give output to bot
+                agent.TryGiveItemStack(outputStack);
+                bool actuallyAdded = outputStack.StackSize == 0;
+
+                // Manual slot insertion fallback if TryGiveItemStack fails
+                if (!actuallyAdded && inventory != null)
+                {
+                    for (int slotIdx = 0; slotIdx < inventory.Count; slotIdx++)
+                    {
+                        var slot = inventory[slotIdx];
+                        if (slot?.Itemstack == null)
+                        {
+                            slot.Itemstack = outputStack.Clone();
+                            slot.MarkDirty();
+                            outputStack.StackSize = 0;
+                            actuallyAdded = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!actuallyAdded)
+                {
+                    // Drop at bot's feet if inventory is full
+                    _serverApi.Logger.Warning($"[VSAI] Inventory full, dropping knapped item at bot's feet");
+                    world.SpawnItemEntity(outputStack, _botEntity.ServerPos.XYZ);
+                }
+
+                craftedItem = new
+                {
+                    code = matchingRecipe.Output.ResolvedItemstack.Collectible?.Code?.ToString() ?? "unknown",
+                    quantity = 1,
+                    name = matchingRecipe.Output.ResolvedItemstack.GetName(),
+                    addedToInventory = actuallyAdded
+                };
+
+                // Remove the knapping surface
+                blockAccessor.SetBlock(0, surfacePos);
+                blockAccessor.TriggerNeighbourBlockUpdate(surfacePos);
+
+                _serverApi.Logger.Notification($"[VSAI] Bot completed knapping: {matchingRecipe.Output.ResolvedItemstack.Collectible?.Code}");
+            }
+            catch (Exception ex)
+            {
+                errorMsg = $"Knapping failed: {ex.Message}";
+                _serverApi.Logger.Error($"[VSAI] Knapping error: {ex.Message}\n{ex.StackTrace}");
+            }
+            finally
+            {
+                waitHandle.Set();
+            }
+        }, "VSAI-Knap");
+
+        waitHandle.Wait(10000);
+
+        if (errorMsg != null)
+        {
+            return JsonError(errorMsg);
+        }
+
+        if (craftedItem == null)
+        {
+            return JsonError("Knapping operation timed out");
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            success = true,
+            recipe = recipeName,
+            output = craftedItem
+        });
     }
 
     private static string ReadRequestBody(HttpListenerRequest request)

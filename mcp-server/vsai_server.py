@@ -363,6 +363,20 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": []
             }
+        ),
+        Tool(
+            name="bot_knap",
+            description="Knap a flint or stone tool. Bot must have flint or stone in inventory. Creates knapping surface, completes recipe instantly, gives output to bot.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "recipe": {
+                        "type": "string",
+                        "description": "Tool to make: 'axe', 'knife', 'shovel', 'hoe', 'spear', or 'arrowhead'"
+                    }
+                },
+                "required": ["recipe"]
+            }
         )
     ]
 
@@ -599,6 +613,11 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if "maxDistance" in arguments:
             data["maxDistance"] = arguments["maxDistance"]
         return http_post("/bot/pickup", data)
+
+    elif name == "bot_knap":
+        return http_post("/bot/knap", {
+            "recipe": arguments["recipe"]
+        })
 
     else:
         return {"error": f"Unknown tool: {name}"}

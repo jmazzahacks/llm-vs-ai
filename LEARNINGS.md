@@ -421,6 +421,7 @@ The target Y must be at actual ground level (where the bot can stand). If target
 | `/bot/collect` | POST | Pick up loose surface item block at position |
 | `/bot/pickup` | POST | Pick up dropped item entity (nearest or by ID) |
 | `/bot/inventory/drop` | POST | Drop item from inventory to world |
+| `/bot/knap` | POST | Knap flint/stone tool (axe, knife, shovel, etc.) |
 | `/screenshot` | POST | Take screenshot (macOS, requires Screen Recording permission) |
 
 ### Movement Status Endpoint
@@ -706,12 +707,12 @@ Added `seraphinventory` to both client and server behaviors:
 
 ### C# Implementation Details
 
-**Required reference:** VSSurvivalMod.dll (contains `EntityBehaviorSeraphInventory`)
+**Custom inventory behavior:** We use `EntityBehaviorBotInventory` with `InventoryGeneric` (32 slots) instead of `SeraphInventory` (only 4 usable slots).
 
 ```csharp
 // Access inventory behavior
-var inventoryBehavior = agent.GetBehavior<EntityBehaviorSeraphInventory>();
-var inventory = inventoryBehavior.Inventory;
+var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+var inventory = inventoryBehavior?.Inventory;
 
 // Give items to entity
 agent.TryGiveItemStack(itemStack);  // Returns true if successful
@@ -980,7 +981,7 @@ block.Activate(world, new Caller() { Entity = entity }, blockSel, new TreeAttrib
 - [Entity Behaviors](https://wiki.vintagestory.at/Modding:Entity_Behaviors)
 - [EntityAgent API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.EntityAgent.html)
 
-## Bot Crafting (Future Enhancement)
+## Bot Crafting - KNAPPING IMPLEMENTED!
 
 ### VS Crafting Systems
 
@@ -988,90 +989,163 @@ Vintage Story has **5 distinct crafting systems**:
 
 | System | Description | Automatable? |
 |--------|-------------|--------------|
-| Grid crafting | 3×3 pattern matching | Potentially |
-| Knapping | Interactive voxel removal for flint/stone tools | No - manual GUI |
-| Clay forming | Voxel placement for pottery | No - manual GUI |
-| Smithing | Anvil hammer strikes for metal tools | No - manual GUI |
-| Casting | Pouring molten metal into molds | No - manual GUI |
+| Grid crafting | 3×3 pattern matching | YES - via GridRecipe API |
+| Knapping | Interactive voxel removal for flint/stone tools | YES - via BlockEntity manipulation |
+| Clay forming | Voxel placement for pottery | YES - similar to knapping |
+| Smithing | Anvil hammer strikes for metal tools | YES - similar to knapping |
+| Casting | Pouring molten metal into molds | Potentially - needs research |
 
-**Key limitation:** Most tool creation (flint, stone, metal) requires interactive GUI processes, not simple grid crafting.
+### Grid Crafting API - FULLY DOCUMENTED
 
-### Grid Crafting API
-
-The `GridRecipe` class has methods for programmatic recipe handling:
-
+**Access all recipes:**
 ```csharp
-// Check if items match a recipe
-bool matches = recipe.Matches(ingredientStacks);
-
-// Remove input items
-recipe.ConsumeInput(player, ingredientSlots, gridWidth);
-
-// Create output item
-ItemStack output = recipe.GenerateOutputStack(api, ingredientSlots);
+List<GridRecipe> recipes = api.World.GridRecipes;
 ```
 
-**Problem:** There's no documented way to:
-- Look up recipes by ingredients
-- Execute recipes from an EntityAgent
-- Access the recipe registry programmatically
+**Three-step crafting process:**
+```csharp
+// 1. Check if items match a recipe
+bool matches = recipe.Matches(player, ingredientSlots, gridWidth);
 
-Crafting is tied to player GUI interaction, not entity behavior.
+// 2. Remove input items (calls OnConsumedByCrafting callbacks)
+recipe.ConsumeInput(player, inputSlots, gridWidth);
 
-### Implementation Options
+// 3. Create output item (calls OnCreatedByCrafting callbacks)
+recipe.GenerateOutputStack(inputSlots, outputSlot);
+```
 
-**Option 1: "Simulated" Crafting (Recommended)**
+**Key GridRecipe methods:**
+- `Matches(IPlayer forPlayer, ItemSlot[] ingredients, int gridWidth)` - Validates ingredients match pattern
+- `MatchesShapeLess(ItemSlot[] suppliedSlots, int gridWidth)` - For shapeless recipes
+- `ConsumeInput(IPlayer byPlayer, ItemSlot[] inputSlots, int gridWidth)` - Removes ingredients
+- `GenerateOutputStack(ItemSlot[] inputSlots, ItemSlot outputSlot)` - Creates output, handles attribute copying
 
-Build a custom system that:
-1. Maintains a simplified recipe database (JSON)
-2. Checks bot inventory against known recipes
-3. Removes ingredients and spawns output item
+**Key GridRecipe properties:**
+- `Enabled` - Can disable recipes at runtime
+- `Shapeless` - Whether ingredient order matters
+- `RequiresTrait` - Player trait requirements (e.g., "knapper")
+- `resolvedIngredients` - Ingredients with pattern codes resolved
+
+### Knapping API - FULLY DOCUMENTED
+
+**Key discovery from [Knapster mod](https://github.com/ApacheTech-VintageStory-Mods/Knapster):**
+
+Knapping uses `BlockEntityKnappingSurface` with a 16x16 voxel grid:
 
 ```csharp
-// Pseudo-code
-if (HasItems(bot, "stick", 1) && HasItems(bot, "flint", 2))
-{
-    RemoveItems(bot, "stick", 1);
-    RemoveItems(bot, "flint", 2);
-    GiveItem(bot, "game:axe-flint");
+// Access knapping surface at block position
+var blockEntity = world.BlockAccessor.GetBlockEntity(blockPos) as BlockEntityKnappingSurface;
+
+// The voxel grid (16x16)
+blockEntity.Voxels[x, z]  // Current state (true = material present)
+
+// The recipe pattern
+blockEntity.SelectedRecipe.Voxels[x, 0, z]  // Target pattern
+
+// INSTANT COMPLETION - copy recipe voxels directly!
+for (var x = 0; x < 16; x++) {
+    for (var z = 0; z < 16; z++) {
+        blockEntity.Voxels[x, z] = blockEntity.SelectedRecipe.Voxels[x, 0, z];
+    }
 }
 ```
 
-**Limitations:**
-- Only works for grid recipes we manually define
-- Skips knapping/smithing/clay entirely
-- Not "real" crafting, just item transformation
+**How Knapster works:**
+1. Uses Harmony to patch `BlockEntityKnappingSurface.OnUseOver()`
+2. Intercepts before vanilla code runs
+3. Directly copies recipe voxels to complete instantly
+4. Has configurable "voxels per click" for partial automation
 
-**Option 2: Access Internal APIs**
+**Clay Forming / Smithing:**
+Similar pattern with `BlockEntityClayForm` and `BlockEntityAnvil` - same voxel grid approach.
 
-Use reflection to access recipe registry:
-- Fragile, may break with VS updates
-- Not officially supported
-- Could enable proper recipe lookup
+### Implementation Plan for Bot Crafting
 
-**Option 3: Knapping Simulation**
+**Phase 1: Grid Crafting** (TODO)
+```csharp
+// Endpoint: /bot/craft
+// 1. Create virtual ItemSlots from bot inventory
+// 2. Iterate through api.World.GridRecipes
+// 3. Find recipe where Matches() returns true
+// 4. Call ConsumeInput() and GenerateOutputStack()
+// 5. Add output to bot inventory
+```
 
-For flint/stone tools that require knapping:
-- Define the final tool shapes
-- Skip the voxel removal process
-- Just check for raw materials and spawn tool
+**Phase 2: Knapping** - IMPLEMENTED & TESTED!
 
-### API Endpoints Needed
+The `/bot/knap` endpoint allows the bot to craft flint/stone tools instantly:
 
-- `/bot/recipes` - GET available recipes bot can craft
-- `/bot/craft` - POST craft item by recipe name
-- `/bot/cancraft` - GET check if bot has materials for recipe
+```bash
+# Knap an axe (bot must have flint or stone in inventory)
+curl -X POST http://localhost:4560/bot/knap \
+  -H "Content-Type: application/json" \
+  -d '{"recipe": "axe"}'
+```
 
-### What the Bot CAN'T Craft (Interactive Only)
+**Tested Results (2026-01-22):**
+- `bot_knap("axe")` - Creates flint axe head from flint ✓
+- `bot_knap("spear")` - Creates flint spear head from flint ✓
+- `bot_knap("knife")` - Requires stone (andesite, etc.) not flint
+- Flint consumed from inventory correctly ✓
+- Output created and either added to inventory or dropped ✓
 
-- Flint tools (knapping required)
-- Stone tools (knapping required)
-- Clay items (clay forming + kiln)
-- Metal tools (smithing on anvil)
-- Cast items (crucible + mold)
+**Implementation approach (ACTUAL WORKING CODE):**
+1. Get recipes via `_serverApi.World.Api.GetKnappingRecipes()` extension method
+2. Find matching recipe by output name (e.g., "axe" matches "axehead")
+3. Find material in bot inventory that satisfies `recipe.Ingredient.SatisfiesAsIngredient()`
+4. Create temporary knapping surface block in front of bot
+5. Set `selectedRecipeId` via reflection (field is private)
+6. Copy `recipe.Voxels[x, 0, z]` to `blockEntity.Voxels[x, z]` for instant completion
+7. Create output itemstack and give to bot via `TryGiveItemStack()` (drops if fails)
+8. Remove knapping surface block
 
-### What the Bot COULD Craft (Grid Recipes)
+**Key code patterns:**
+```csharp
+// Get recipe list - use extension method, NOT direct property
+var recipes = _serverApi.World.Api.GetKnappingRecipes();
 
+// Find recipe by output
+var recipe = recipes.FirstOrDefault(r =>
+    r.Output.ResolvedItemstack.Collectible.Code.Path.Contains(recipeName));
+
+// Set recipe via reflection (selectedRecipeId is private)
+var field = blockEntity.GetType().GetField("selectedRecipeId",
+    BindingFlags.NonPublic | BindingFlags.Instance);
+field.SetValue(blockEntity, recipeIndex);
+
+// Instant completion - copy recipe voxels
+for (int x = 0; x < 16; x++) {
+    for (int z = 0; z < 16; z++) {
+        blockEntity.Voxels[x, z] = recipe.Voxels[x, 0, z];
+    }
+}
+```
+
+**Phase 3: Clay Forming / Smithing** (TODO)
+Same pattern as knapping with respective BlockEntity classes.
+
+### Mods Analyzed
+
+| Mod | Approach | Useful For |
+|-----|----------|------------|
+| [Knapster](https://github.com/ApacheTech-VintageStory-Mods/Knapster) | Harmony patches + voxel copy | Knapping instant-complete code |
+| [QPTECH](https://github.com/Novocain1/qptech) | Custom config-based recipes | Machine automation patterns |
+| [ImmersiveCrafting](https://github.com/Craluminum-Mods/ImmersiveCrafting) | Custom block behaviors | Liquid/tool crafting |
+
+### Crafting API Endpoints
+
+| Endpoint | Method | Status | Description |
+|----------|--------|--------|-------------|
+| `/bot/knap` | POST | **DONE** | Knap flint/stone tool from inventory material |
+| `/bot/recipes` | GET | TODO | List available grid recipes bot can craft |
+| `/bot/craft` | POST | TODO | Craft item by recipe name/output |
+| `/bot/cancraft` | GET | TODO | Check if bot has materials for recipe |
+| `/bot/clayform` | POST | TODO | Complete clay forming at position |
+| `/bot/smith` | POST | TODO | Complete smithing at position |
+
+### What the Bot CAN Craft
+
+**Grid Recipes (Phase 1):**
 - Planks from logs
 - Sticks from planks
 - Torches
@@ -1080,10 +1154,24 @@ For flint/stone tools that require knapping:
 - Storage containers
 - Basic blocks
 
+**Knapping (Phase 2):**
+- Flint axe, knife, shovel, hoe, spear
+- Stone versions of all tools
+
+**Clay Forming (Phase 3):**
+- Bowls, pots, storage vessels
+- Crucibles, molds
+
+**Smithing (Phase 3):**
+- Metal tools (after smelting)
+- Weapons, armor
+
 ### Relevant VS Modding Docs
 
 - [GridRecipe API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.GridRecipe.html)
+- [IWorldAccessor.GridRecipes](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.IWorldAccessor.html)
 - [Grid Recipes Guide](https://wiki.vintagestory.at/Modding:Grid_Recipes_Guide)
+- [Knapping Recipes](https://wiki.vintagestory.at/Modding:Asset_Type_-_Recipes_(Knapping))
 - [Crafting Wiki](https://wiki.vintagestory.at/Crafting)
 - [Knapping Wiki](https://wiki.vintagestory.at/Knapping)
 
@@ -1781,4 +1869,82 @@ def _can_escape_pit(x, z, surface_y, heightmap, solid_blocks, liquid_blocks, max
 **Birch leaves:** `leavesbranchy-grown*-birch` blocks are solid and have collision, unlike regular leaves.
 
 ---
-*Last updated: Session 18 - Added trap avoidance to pathfinding, confirmed long-distance (317+ blocks) bot movement working.*
+
+## Known Issues / Bugs to Investigate
+
+### ~~1. Bot Pickup Fails for Tool Heads~~ - RESOLVED
+
+**Root cause:** `TryGiveItemStack()` fails for tool heads on EntityAgent with SeraphInventory, even with empty slots. SeraphInventory reserves slots 0-14 for equipment and only has 4 usable backpack slots (15-18).
+
+**Solution:** Created custom `EntityBehaviorBotInventory` using `InventoryGeneric` with 32 general-purpose slots. All slots can hold any item, no equipment restrictions.
+
+```csharp
+// Custom inventory behavior (EntityBehaviorBotInventory.cs)
+public class EntityBehaviorBotInventory : EntityBehavior
+{
+    public InventoryGeneric Inventory { get; private set; }
+    public const int DefaultSlotCount = 32;
+
+    public override void Initialize(EntityProperties properties, JsonObject attributes)
+    {
+        Inventory = new InventoryGeneric(_slotCount, "botinventory", instanceId, entity.Api);
+    }
+}
+
+// Access in handlers
+var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+var inventory = inventoryBehavior?.Inventory;
+```
+
+Also kept manual slot insertion fallback in case `TryGiveItemStack()` fails:
+
+```csharp
+// Manual slot insertion fallback
+if (amountGiven == 0 && inventory != null)
+{
+    int[] slotOrder = { 15, 16, 17, 18 };
+    foreach (int slotIdx in slotOrder)
+    {
+        if (slotIdx >= inventory.Count) continue;
+        var slot = inventory[slotIdx];
+        if (slot?.Itemstack == null)
+        {
+            slot.Itemstack = stackToGive.Clone();
+            slot.MarkDirty();
+            amountGiven = originalSize;
+            break;
+        }
+    }
+}
+```
+
+### 2. Bot Pathfinding Through Doors
+
+**Symptom:** Bot gets stuck at door even after opening it with `bot_interact`.
+
+**Observations:**
+- `bot_interact` successfully opens door (block becomes non-solid)
+- `bot_goto` still reports "stuck" at door position
+- Pathfinding may cache collision data or not recognize opened doors
+
+**Possible causes:**
+- Pathfinder caches block solidity at path calculation time
+- Door block still has collision box even when "open"
+- Need to recalculate path after door state change
+
+**Workaround:** Despawn/respawn bot on other side of door.
+
+### 3. Bot Spawn Position Ignores Coordinates
+
+**Symptom:** Bot always spawns near player regardless of specified x/y/z coordinates.
+
+**Observations:**
+- `bot_spawn(x=511920, y=110, z=512000)` spawns at `(511926, 110, 511969)` near player
+- Consistent behavior across multiple spawn attempts
+
+**Possible cause:** Spawn logic might be finding nearest valid spawn point to player.
+
+**To investigate:** Check spawn implementation in HandleBotSpawn.
+
+---
+*Last updated: Session 20 - Created custom EntityBehaviorBotInventory with 32 slots (replacing SeraphInventory's 4-slot limit).*

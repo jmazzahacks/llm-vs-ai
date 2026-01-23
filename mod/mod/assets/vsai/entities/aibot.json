@@ -39,7 +39,7 @@
                 "code": "interpolateposition"
             },
             {
-                "code": "seraphinventory"
+                "code": "botinventory"
             }
         ],
         "animations": [
@@ -110,7 +110,7 @@
                 "onlyWhenDead": false
             },
             {
-                "code": "seraphinventory"
+                "code": "botinventory"
             },
             {
                 "code": "taskai",
