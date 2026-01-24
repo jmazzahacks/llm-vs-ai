@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Reflection;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -106,6 +107,10 @@ public class VsaiModSystem : ModSystem
     public override void StartClientSide(ICoreClientAPI api)
     {
         api.Logger.Notification("[VSAI] Starting client-side for minimap integration...");
+
+        // Register custom entity renderer for held item rendering
+        api.RegisterEntityRendererClass("AiBotRenderer", typeof(EntityAiBotRenderer));
+        api.Logger.Notification("[VSAI] Registered entity renderer: AiBotRenderer");
 
         // Register the bot map layer with the world map
         var mapManager = api.ModLoader.GetModSystem<WorldMapManager>();
@@ -355,6 +360,18 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/mine":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotMine(request);
+                    }
+                    break;
+
                 case "/bot/place":
                     if (method != "POST")
                     {
@@ -376,6 +393,18 @@ public class VsaiModSystem : ModSystem
                     else
                     {
                         responseBody = HandleBotInteract(request);
+                    }
+                    break;
+
+                case "/bot/use_tool":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotUseTool(request);
                     }
                     break;
 
@@ -1226,6 +1255,452 @@ public class VsaiModSystem : ModSystem
                 brokenBlock = blockCode,
                 position = new { x, y, z },
                 drops = drops
+            });
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Mine a block with tool tier checking. Only gives drops if equipped tool has sufficient tier.
+    /// </summary>
+    private string HandleBotMine(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide x, y, z block coordinates.");
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            int x, y, z;
+
+            // Support relative coordinates from bot position
+            if (root.TryGetProperty("relative", out var relative) && relative.GetBoolean())
+            {
+                var botBlockPos = _botEntity.ServerPos.AsBlockPos;
+                int dx = root.TryGetProperty("x", out var dxEl) ? dxEl.GetInt32() : 0;
+                int dy = root.TryGetProperty("y", out var dyEl) ? dyEl.GetInt32() : 0;
+                int dz = root.TryGetProperty("z", out var dzEl) ? dzEl.GetInt32() : 0;
+
+                x = botBlockPos.X + dx;
+                y = botBlockPos.Y + dy;
+                z = botBlockPos.Z + dz;
+            }
+            else
+            {
+                if (!root.TryGetProperty("x", out var xEl) ||
+                    !root.TryGetProperty("y", out var yEl) ||
+                    !root.TryGetProperty("z", out var zEl))
+                {
+                    return JsonError("Missing x, y, or z coordinates");
+                }
+
+                x = xEl.GetInt32();
+                y = yEl.GetInt32();
+                z = zEl.GetInt32();
+            }
+
+            var blockAccessor = _serverApi?.World?.BlockAccessor;
+            if (blockAccessor == null)
+            {
+                return JsonError("World not available");
+            }
+
+            var blockPos = new BlockPos(x, y, z, _botEntity.ServerPos.Dimension);
+            var block = blockAccessor.GetBlock(blockPos);
+
+            if (block == null || block.Code?.Path == "air")
+            {
+                return JsonError($"No block at position ({x}, {y}, {z})");
+            }
+
+            string blockCode = block.Code?.Path ?? "unknown";
+
+            // Get equipped tool from right hand
+            var toolSlot = agent.RightHandItemSlot;
+            var toolStack = toolSlot?.Itemstack;
+            int toolTier = toolStack?.Collectible?.ToolTier ?? 0;
+            string toolCode = toolStack?.Collectible?.Code?.Path ?? "none";
+
+            // Get block's required mining tier
+            int requiredTier = block.RequiredMiningTier;
+
+            // Check if tool tier is sufficient
+            bool canGetDrops = toolTier >= requiredTier;
+
+            var drops = new List<string>();
+            var waitHandle = new ManualResetEventSlim(false);
+            string? errorMsg = null;
+
+            _serverApi?.Event.EnqueueMainThreadTask(() =>
+            {
+                try
+                {
+                    // Get drops only if tool tier is sufficient
+                    ItemStack[]? blockDrops = null;
+                    if (canGetDrops)
+                    {
+                        blockDrops = block.GetDrops(_serverApi.World, blockPos, null);
+                        if (blockDrops != null)
+                        {
+                            foreach (var drop in blockDrops)
+                            {
+                                drops.Add($"{drop.StackSize}x {drop.Collectible?.Code?.Path ?? "unknown"}");
+                            }
+                        }
+                    }
+
+                    // Break the block (set to air)
+                    blockAccessor.SetBlock(0, blockPos);
+                    blockAccessor.TriggerNeighbourBlockUpdate(blockPos);
+
+                    // Spawn drops as items in the world (only if we got drops)
+                    if (blockDrops != null)
+                    {
+                        foreach (var drop in blockDrops)
+                        {
+                            _serverApi.World.SpawnItemEntity(drop, new Vec3d(x + 0.5, y + 0.5, z + 0.5));
+                        }
+                    }
+
+                    _serverApi.Logger.Debug($"[VSAI] Bot mined block {blockCode} at ({x}, {y}, {z}), tool={toolCode}, tier={toolTier}, required={requiredTier}, dropsObtained={canGetDrops}");
+                }
+                catch (Exception ex)
+                {
+                    errorMsg = ex.Message;
+                }
+                finally
+                {
+                    waitHandle.Set();
+                }
+            }, "VSAI-MineBlock");
+
+            waitHandle.Wait(2000);
+
+            if (errorMsg != null)
+            {
+                return JsonError(errorMsg);
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                brokenBlock = blockCode,
+                position = new { x, y, z },
+                tool = new { code = toolCode, tier = toolTier },
+                requiredTier = requiredTier,
+                dropsObtained = canGetDrops,
+                drops = drops
+            });
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+    }
+
+    private string HandleBotUseTool(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide x, y, z block coordinates.");
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            int x, y, z;
+
+            // Support relative coordinates from bot position
+            if (root.TryGetProperty("relative", out var relative) && relative.GetBoolean())
+            {
+                var botBlockPos = _botEntity.ServerPos.AsBlockPos;
+                int dx = root.TryGetProperty("x", out var dxEl) ? dxEl.GetInt32() : 0;
+                int dy = root.TryGetProperty("y", out var dyEl) ? dyEl.GetInt32() : 0;
+                int dz = root.TryGetProperty("z", out var dzEl) ? dzEl.GetInt32() : 0;
+
+                x = botBlockPos.X + dx;
+                y = botBlockPos.Y + dy;
+                z = botBlockPos.Z + dz;
+            }
+            else
+            {
+                if (!root.TryGetProperty("x", out var xEl) ||
+                    !root.TryGetProperty("y", out var yEl) ||
+                    !root.TryGetProperty("z", out var zEl))
+                {
+                    return JsonError("Missing x, y, or z coordinates");
+                }
+
+                x = xEl.GetInt32();
+                y = yEl.GetInt32();
+                z = zEl.GetInt32();
+            }
+
+            var blockAccessor = _serverApi?.World?.BlockAccessor;
+            if (blockAccessor == null)
+            {
+                return JsonError("World not available");
+            }
+
+            var blockPos = new BlockPos(x, y, z, _botEntity.ServerPos.Dimension);
+            var blockBefore = blockAccessor.GetBlock(blockPos);
+
+            if (blockBefore == null || blockBefore.Code?.Path == "air")
+            {
+                return JsonError($"No block at position ({x}, {y}, {z})");
+            }
+
+            // Get equipped tool from right hand
+            var toolSlot = agent.RightHandItemSlot;
+            var toolStack = toolSlot?.Itemstack;
+            if (toolStack == null)
+            {
+                return JsonError("No tool equipped in right hand");
+            }
+
+            var collectible = toolStack.Collectible;
+            if (collectible == null)
+            {
+                return JsonError("Tool has no collectible data");
+            }
+            string toolCode = collectible.Code?.Path ?? "unknown";
+            string blockCodeBefore = blockBefore.Code?.Path ?? "unknown";
+
+            string? resultMsg = null;
+            string? errorMsg = null;
+            bool actionTaken = false;
+            string? blockCodeAfter = null;
+            var waitHandle = new ManualResetEventSlim(false);
+
+            _serverApi?.Event.EnqueueMainThreadTask(() =>
+            {
+                try
+                {
+                    // Create BlockSelection for the target
+                    var blockSel = new BlockSelection
+                    {
+                        Position = blockPos,
+                        Face = BlockFacing.UP
+                    };
+
+                    var world = _serverApi.World;
+                    var droppedItems = new List<string>();
+
+                    // First, check if block has tool-specific drops (e.g., tallgrass with knife)
+                    // VS uses "tool" property in drops array to filter by tool type
+                    var blockDrops = blockBefore.Drops;
+                    bool hasToolSpecificDrop = false;
+
+                    // Get the tool type from the collectible
+                    var toolType = collectible.Tool;
+
+                    if (blockDrops != null && toolType != null)
+                    {
+                        foreach (var drop in blockDrops)
+                        {
+                            if (drop?.Tool == toolType)
+                            {
+                                hasToolSpecificDrop = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (hasToolSpecificDrop)
+                    {
+                        // Manually process drops that match our tool type
+                        // VS GetDrops doesn't take tool directly - it checks the player's tool
+                        // Since we have an EntityAgent not IPlayer, we manually filter
+                        foreach (var drop in blockDrops)
+                        {
+                            if (drop?.Tool != toolType) continue;
+
+                            // Resolve the drop stack
+                            var itemStack = drop.GetNextItemStack();
+                            if (itemStack == null) continue;
+
+                            int originalSize = itemStack.StackSize;
+                            bool given = agent.TryGiveItemStack(itemStack);
+                            int givenCount = given ? (originalSize - itemStack.StackSize) : 0;
+                            if (givenCount > 0)
+                            {
+                                droppedItems.Add($"{givenCount}x {itemStack.Collectible?.Code?.Path ?? "unknown"}");
+                            }
+                            // Drop remainder in world
+                            if (itemStack.StackSize > 0)
+                            {
+                                world.SpawnItemEntity(itemStack, new Vec3d(blockPos.X + 0.5, blockPos.Y + 0.5, blockPos.Z + 0.5));
+                                droppedItems.Add($"{itemStack.StackSize}x {itemStack.Collectible?.Code?.Path ?? "unknown"} (dropped)");
+                            }
+                        }
+
+                        // Remove the block (harvest it)
+                        blockAccessor.SetBlock(0, blockPos);
+                        actionTaken = true;
+                    }
+                    // Check for Harvestable behavior on the block (berries, resin, etc.)
+                    else
+                    {
+                        var harvestBehavior = blockBefore.GetBehavior<BlockBehaviorHarvestable>();
+                        if (harvestBehavior != null)
+                        {
+                            // Use reflection to access private/internal fields
+                            var behaviorType = harvestBehavior.GetType();
+                            var stacksField = behaviorType.GetField("harvestedStacks", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            var blockCodeField = behaviorType.GetField("harvestedBlockCode", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                            var harvestedStacks = stacksField?.GetValue(harvestBehavior) as BlockDropItemStack[];
+                            var harvestedBlockCode = blockCodeField?.GetValue(harvestBehavior) as AssetLocation;
+
+                            // Give harvested items to bot
+                            if (harvestedStacks != null)
+                            {
+                                foreach (var dropStack in harvestedStacks)
+                                {
+                                    if (dropStack == null) continue;
+
+                                    // Resolve the drop stack
+                                    var itemStack = dropStack.GetNextItemStack();
+                                    if (itemStack != null)
+                                    {
+                                        int originalSize = itemStack.StackSize;
+                                        // Try to give to bot
+                                        bool given = agent.TryGiveItemStack(itemStack);
+                                        int givenCount = given ? (originalSize - itemStack.StackSize) : 0;
+                                        if (givenCount > 0)
+                                        {
+                                            droppedItems.Add($"{givenCount}x {itemStack.Collectible?.Code?.Path ?? "unknown"}");
+                                        }
+                                        // Drop remainder in world
+                                        if (itemStack.StackSize > 0)
+                                        {
+                                            world.SpawnItemEntity(itemStack, new Vec3d(blockPos.X + 0.5, blockPos.Y + 0.5, blockPos.Z + 0.5));
+                                            droppedItems.Add($"{itemStack.StackSize}x {itemStack.Collectible?.Code?.Path ?? "unknown"} (dropped)");
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Replace block with harvested block (usually air)
+                            if (harvestedBlockCode != null)
+                            {
+                                var newBlock = world.GetBlock(harvestedBlockCode);
+                                if (newBlock != null)
+                                {
+                                    blockAccessor.SetBlock(newBlock.BlockId, blockPos);
+                                }
+                                else
+                                {
+                                    blockAccessor.SetBlock(0, blockPos); // Set to air
+                                }
+                            }
+                            else
+                            {
+                                blockAccessor.SetBlock(0, blockPos); // Set to air
+                            }
+
+                            actionTaken = true;
+                        }
+                        else
+                        {
+                            // No harvestable behavior - try tool's OnHeldAttack methods
+                            var attackHandling = EnumHandHandling.NotHandled;
+                            collectible.OnHeldAttackStart(toolSlot, agent, blockSel, null, ref attackHandling);
+
+                            if (attackHandling != EnumHandHandling.NotHandled)
+                            {
+                                // Tool handled the attack - simulate completion
+                                bool continueAttack = collectible.OnHeldAttackStep(10f, toolSlot, agent, blockSel, null);
+                                collectible.OnHeldAttackStop(10f, toolSlot, agent, blockSel, null);
+                                actionTaken = true;
+                            }
+                        }
+                    }
+
+                    // Check what happened to the block
+                    var blockAfter = blockAccessor.GetBlock(blockPos);
+                    blockCodeAfter = blockAfter?.Code?.Path ?? "air";
+
+                    if (blockCodeAfter != blockCodeBefore)
+                    {
+                        if (droppedItems.Count > 0)
+                        {
+                            resultMsg = $"Harvested {blockCodeBefore} with {toolCode} - got {string.Join(", ", droppedItems)}";
+                        }
+                        else
+                        {
+                            resultMsg = $"Used {toolCode} on {blockCodeBefore} - block changed to {blockCodeAfter}";
+                        }
+                    }
+                    else if (actionTaken)
+                    {
+                        resultMsg = $"Used {toolCode} on {blockCodeBefore} - action performed but block unchanged";
+                    }
+                    else
+                    {
+                        resultMsg = $"Tool {toolCode} did not handle action on {blockCodeBefore} (no matching tool drops or harvestable behavior)";
+                    }
+
+                    _serverApi.Logger.Notification($"[VSAI] Bot used tool: {resultMsg}");
+                }
+                catch (Exception ex)
+                {
+                    errorMsg = ex.Message;
+                    _serverApi.Logger.Error($"[VSAI] UseTool error: {ex.Message}\n{ex.StackTrace}");
+                }
+                finally
+                {
+                    waitHandle.Set();
+                }
+            }, "VSAI-UseTool");
+
+            waitHandle.Wait(5000);
+
+            if (errorMsg != null)
+            {
+                return JsonError(errorMsg);
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                message = resultMsg,
+                tool = toolCode,
+                blockBefore = blockCodeBefore,
+                blockAfter = blockCodeAfter,
+                position = new { x, y, z },
+                actionTaken
             });
         }
         catch (JsonException ex)
@@ -3214,6 +3689,9 @@ public class VsaiModSystem : ModSystem
                 // Put previous hand item (if any) back in inventory slot
                 sourceSlot.Itemstack = previousHandItem;
                 sourceSlot.MarkDirty();
+
+                // Sync hand slots to WatchedAttributes for client-side rendering
+                inventoryBehavior.SyncAllHandSlots();
 
                 equippedItem = new
                 {

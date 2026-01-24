@@ -222,6 +222,24 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="bot_mine",
+            description="Mine a block using equipped tool. Respects tool tier - drops only if tool tier >= block requirement. Bot should have appropriate tool equipped (pickaxe for stone/ore, axe for wood, etc.). Tool tiers: 0=none, 1=stone/flint, 2=copper, 3=bronze, 4=iron, 5=steel.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Block X coordinate"},
+                    "y": {"type": "integer", "description": "Block Y coordinate"},
+                    "z": {"type": "integer", "description": "Block Z coordinate"},
+                    "relative": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, coordinates are relative to bot position"
+                    }
+                },
+                "required": ["x", "y", "z"]
+            }
+        ),
+        Tool(
             name="bot_place",
             description="Place a block at the specified position.",
             inputSchema={
@@ -414,6 +432,24 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": []
             }
+        ),
+        Tool(
+            name="bot_use_tool",
+            description="Use equipped tool on a block (left-click action). Simulates attack/harvest actions like using a knife on grass to get dry grass, or using an axe to strip bark. Bot must have appropriate tool equipped.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Block X coordinate"},
+                    "y": {"type": "integer", "description": "Block Y coordinate"},
+                    "z": {"type": "integer", "description": "Block Z coordinate"},
+                    "relative": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, coordinates are relative to bot position"
+                    }
+                },
+                "required": ["x", "y", "z"]
+            }
         )
     ]
 
@@ -571,6 +607,14 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "z": arguments["z"]
         })
 
+    elif name == "bot_mine":
+        return http_post("/bot/mine", {
+            "x": arguments["x"],
+            "y": arguments["y"],
+            "z": arguments["z"],
+            "relative": arguments.get("relative", False)
+        })
+
     elif name == "bot_place":
         return http_post("/bot/place", {
             "x": arguments["x"],
@@ -670,6 +714,14 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if "hand" in arguments:
             data["hand"] = arguments["hand"]
         return http_post("/bot/equip", data)
+
+    elif name == "bot_use_tool":
+        return http_post("/bot/use_tool", {
+            "x": arguments["x"],
+            "y": arguments["y"],
+            "z": arguments["z"],
+            "relative": arguments.get("relative", False)
+        })
 
     else:
         return {"error": f"Unknown tool: {name}"}

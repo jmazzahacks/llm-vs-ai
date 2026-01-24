@@ -1190,18 +1190,45 @@ Same pattern as knapping with respective BlockEntity classes.
 - [Crafting Wiki](https://wiki.vintagestory.at/Crafting)
 - [Knapping Wiki](https://wiki.vintagestory.at/Knapping)
 
-## Bot Mining (Future Enhancement)
+## Bot Mining
 
-### Current Implementation (Cheat Mode)
+### Available Endpoints
 
-The current `/bot/break` endpoint bypasses tool requirements:
+| Endpoint | Behavior | Use Case |
+|----------|----------|----------|
+| `/bot/break` | Instant break, always drops | Testing/cheat mode |
+| `/bot/mine` | Checks tool tier, conditional drops | Realistic mining |
+
+### `/bot/mine` Implementation (DONE!)
+
+The `/bot/mine` endpoint respects tool tier requirements:
 
 ```csharp
-block.GetDrops(_serverApi.World, blockPos, null);  // null = no tool check
-blockAccessor.SetBlock(0, blockPos);  // Instant break
+var toolSlot = agent.RightHandItemSlot;
+int toolTier = toolSlot?.Itemstack?.Collectible?.ToolTier ?? 0;
+int requiredTier = block.RequiredMiningTier;
+bool canGetDrops = toolTier >= requiredTier;
+
+// Block always breaks, but drops only if tool tier is sufficient
+if (canGetDrops) {
+    blockDrops = block.GetDrops(_serverApi.World, blockPos, null);
+    // Spawn drops in world
+}
+blockAccessor.SetBlock(0, blockPos);
 ```
 
-**Result:** Bot can break ANY block instantly without tools, always gets drops.
+**Response format:**
+```json
+{
+  "success": true,
+  "brokenBlock": "rock-granite",
+  "position": {"x": 512100, "y": 120, "z": 511850},
+  "tool": {"code": "pickaxe-flint", "tier": 1},
+  "requiredTier": 1,
+  "dropsObtained": true,
+  "drops": ["1x stone-granite"]
+}
+```
 
 ### How VS Mining Actually Works
 
@@ -1274,19 +1301,12 @@ To implement realistic mining:
    var drops = block.GetDrops(world, pos, playerWithTool);
    ```
 
-### API Endpoints Needed
+### Future Enhancements
 
-- `/bot/mine` - POST mine block with equipped tool (respects tier/time)
-- `/bot/break` - POST instant break (current cheat mode, for testing)
 - `/bot/canmine` - GET check if bot can mine block with current tool
-
-### Implementation Order
-
-Mining depends on inventory system:
-1. Implement inventory (hold tools)
-2. Implement tool equipping
-3. Implement proper mining with tier checks
-4. Add mining time delays
+- Mining time simulation based on `block.Resistance / tool.MiningSpeed[material]`
+- Tool durability tracking
+- Tool type matching (pickaxe for stone, axe for wood)
 
 ### Relevant VS Modding Docs
 
@@ -1310,7 +1330,7 @@ Mining depends on inventory system:
 10. ~~**Inventory management**~~ - DONE! Manual pickup/drop with seraphinventory behavior
 11. **Hunger/satiety system** - Add hunger behavior, feeding endpoints
 12. **Crafting system** - Simulated grid crafting for basic recipes
-13. **Mining system** - Tool tier checks, mining time, proper drops
+13. ~~**Mining system**~~ - DONE! `/bot/mine` with tool tier checks, conditional drops
 14. **Combat** - Attack entities, defend
 
 ## Key Insights from Session 6
@@ -1962,4 +1982,239 @@ if (amountGiven == 0 && inventory != null)
 **To investigate:** Check spawn implementation in HandleBotSpawn.
 
 ---
-*Last updated: Session 20 - Created custom EntityBehaviorBotInventory with 32 slots (replacing SeraphInventory's 4-slot limit).*
+
+## Bot Held Item Rendering - WORKING!
+
+### The Problem
+
+When the bot equips an item via `/bot/equip`, the API returns success and the inventory shows the item in the hand slot, but the item was NOT visually rendered on the bot's model.
+
+**Root cause:** The default `EntityShapeRenderer` doesn't render held items for non-player entities. `EntityPlayerShapeRenderer` has special `RenderHeldItem()` logic, but regular entities don't get this.
+
+### The Solution
+
+Created a custom entity renderer (`EntityAiBotRenderer`) that:
+1. Extends `EntityShapeRenderer`
+2. Syncs hand items via `WatchedAttributes` (server → client)
+3. Uses the base class `RenderItem()` method for correct positioning
+
+### Key Components
+
+**1. Custom Renderer (EntityAiBotRenderer.cs):**
+```csharp
+public class EntityAiBotRenderer : EntityShapeRenderer
+{
+    private DummySlot? _dummySlot;
+
+    public override void DoRender3DOpaque(float dt, bool isShadowPass)
+    {
+        base.DoRender3DOpaque(dt, isShadowPass);
+        RenderBotHeldItem(dt, true, isShadowPass);  // Right hand
+        RenderBotHeldItem(dt, false, isShadowPass); // Left hand
+    }
+
+    private void RenderBotHeldItem(float dt, bool rightHand, bool isShadowPass)
+    {
+        // Read from WatchedAttributes (synced from server)
+        string attrKey = rightHand
+            ? EntityBehaviorBotInventory.RightHandAttrKey
+            : EntityBehaviorBotInventory.LeftHandAttrKey;
+
+        ItemStack? stack = entity.WatchedAttributes.GetItemstack(attrKey);
+        if (stack == null) return;
+
+        stack.ResolveBlockOrItem(entity.World);
+        if (stack.Collectible == null) return;
+
+        // Get attachment point
+        string attachmentCode = rightHand ? "RightHand" : "LeftHand";
+        var apap = entity.AnimManager?.Animator?.GetAttachmentPointPose(attachmentCode);
+        if (apap == null) return;
+
+        // Get render info via dummy slot
+        if (_dummySlot == null) _dummySlot = new DummySlot();
+        _dummySlot.Itemstack = stack;
+        var renderInfo = capi.Render.GetItemStackRenderInfo(_dummySlot, EnumItemRenderTarget.HandTp, dt);
+        if (renderInfo?.ModelRef == null) return;
+
+        // Use base class for correct matrix math!
+        RenderItem(dt, isShadowPass, stack, apap, renderInfo);
+    }
+}
+```
+
+**2. WatchedAttributes Sync (EntityBehaviorBotInventory.cs):**
+```csharp
+public const string RightHandAttrKey = "rightHandItem";
+public const string LeftHandAttrKey = "leftHandItem";
+
+// Call after equipping
+public void SyncHandSlotToWatchedAttributes(int slotIndex)
+{
+    string attrKey = slotIndex == 0 ? RightHandAttrKey : LeftHandAttrKey;
+    ItemSlot slot = slotIndex == 0 ? RightHandSlot : LeftHandSlot;
+
+    if (slot.Empty)
+        entity.WatchedAttributes.RemoveAttribute(attrKey);
+    else
+        entity.WatchedAttributes.SetItemstack(attrKey, slot.Itemstack);
+
+    entity.WatchedAttributes.MarkPathDirty(attrKey);
+}
+```
+
+**3. Entity JSON Configuration:**
+```json
+{
+    "client": {
+        "renderer": "AiBotRenderer",
+        ...
+    }
+}
+```
+
+**4. Renderer Registration (VsaiModSystem.cs):**
+```csharp
+public override void StartClientSide(ICoreClientAPI api)
+{
+    api.RegisterEntityRendererClass("AiBotRenderer", typeof(EntityAiBotRenderer));
+}
+```
+
+### Key Learnings
+
+1. **WatchedAttributes auto-sync:** Server-side changes to `WatchedAttributes` automatically sync to connected clients. Use `SetItemstack()` and `GetItemstack()` for ItemStack storage.
+
+2. **ResolveBlockOrItem required:** After calling `GetItemstack()` on client, MUST call `stack.ResolveBlockOrItem(world)` to properly resolve the item/block reference.
+
+3. **Use base class RenderItem():** Don't manually build transformation matrices - the base `EntityShapeRenderer.RenderItem()` method handles all the complex matrix math for attachment points correctly.
+
+4. **DummySlot for render info:** `GetItemStackRenderInfo()` requires an `ItemSlot`, but we only have an `ItemStack` from WatchedAttributes. Use `DummySlot` as a wrapper.
+
+5. **MultiTextureMeshRef handling:** If manually rendering (not using base RenderItem), iterate through `mmr.meshrefs[]` and `mmr.textureids[]` arrays rather than using `RenderMultiTextureMesh()` which requires specific shader sampler names.
+
+### Crashes Encountered & Fixed
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `KeyNotFoundException: 'tex2d'` | Using `RenderMultiTextureMesh` with wrong sampler name | Use base class `RenderItem()` or iterate meshrefs manually |
+| `cannot convert 'MultiTextureMeshRef' to 'MeshRef'` | Calling `RenderMesh(modelRef)` directly | Iterate `mmr.meshrefs[]` array |
+| Item at wrong position | Manual matrix math incorrect | Use base class `RenderItem()` method |
+
+### Result
+
+Bot now visually displays held items (stones, spears, tools) in the correct hand position. Items follow the hand animation during movement.
+
+---
+
+## Bot Tool Use - IMPLEMENTED!
+
+### Overview
+
+The `/bot/use_tool` endpoint simulates left-click attack/harvest actions - like using a knife on grass to get dry grass.
+
+### How Tool-Based Harvesting Works in VS
+
+**Key Discovery:** There are TWO different harvesting systems in VS:
+
+#### 1. Tool-Specific Drops (Tallgrass, etc.)
+
+Blocks like tallgrass use the standard `drops` array with a `tool` filter:
+
+```json
+// From tallgrass block JSON
+"drops": [
+  { "type": "item", "code": "drygrass", "tool": "knife" }
+]
+```
+
+- The drop only occurs when broken with the specified tool
+- This is NOT `BlockBehaviorHarvestable` - it's the normal drops system
+- Tallgrass does NOT have `BlockBehaviorHarvestable`!
+
+#### 2. BlockBehaviorHarvestable (Berries, Resin, etc.)
+
+Some blocks use the `Harvestable` behavior for renewable harvests:
+
+```json
+{
+  "code": "harvestable",
+  "harvestTime": 0.5,
+  "harvestedBlockCode": "log-resinharvested-{wood}-ud",
+  "harvestedStack": { "type": "item", "code": "resin" }
+}
+```
+
+Blocks that use this: `bigberrybush`, `smallberrybush`, `saguarocactus`, `log-resin`
+
+### Endpoint Comparison
+
+| Endpoint | Action | Method Used |
+|----------|--------|-------------|
+| `/bot/interact` | Right-click | `block.Activate()` |
+| `/bot/mine` | Break block | `block.GetDrops()` + `SetBlock(0)` |
+| `/bot/use_tool` | Tool-specific harvest | Check drops with tool filter |
+
+### Implementation
+
+The `/bot/use_tool` endpoint handles both systems:
+
+1. **Check tool-specific drops first:**
+   - Get equipped tool's type from `collectible.Tool`
+   - Check block's `Drops` array for drops with matching `Tool` property
+   - If found, manually process those drops and remove block
+
+2. **Fall back to BlockBehaviorHarvestable:**
+   - Check for `Harvestable` behavior on block
+   - Use reflection to access `harvestedStacks` and `harvestedBlockCode`
+   - Process harvest and replace block
+
+3. **Fall back to OnHeldAttack methods:**
+   - Call tool's `OnHeldAttackStart/Step/Stop` for other interactions
+
+### API Endpoint
+
+```bash
+curl -X POST http://localhost:4560/bot/use_tool \
+  -H "Content-Type: application/json" \
+  -d '{"x": 511774, "y": 120, "z": 511944}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Used knife-generic-flint on tallgrass-medium-free - block changed to air",
+  "tool": "knife-generic-flint",
+  "blockBefore": "tallgrass-medium-free",
+  "blockAfter": "air",
+  "position": {"x": 511774, "y": 120, "z": 511944},
+  "actionTaken": true
+}
+```
+
+### Tool Use Reference
+
+| Tool | Block | Result |
+|------|-------|--------|
+| Knife | Tallgrass | Dry grass bundle |
+| Knife | Cattail | Cattail root |
+| Axe | Log | Strip bark (debarked log) |
+| Hoe | Soil | Farmland |
+
+### MCP Tool
+
+```python
+bot_use_tool(x=512100, y=120, z=511850)              # Absolute coordinates
+bot_use_tool(x=1, y=0, z=1, relative=True)           # Relative to bot
+```
+
+### Notes
+
+1. **Tool types:** VS tools have a `Tool` property (e.g., `EnumTool.Knife`). Block drops filter by this.
+2. **Drops handling:** Items are given to bot via `TryGiveItemStack()`, overflow spawns in world.
+3. **Tool durability:** Current implementation does not reduce tool durability.
+4. **GetDrops limitation:** `Block.GetDrops()` doesn't take a tool parameter - it checks the player's tool. Since our bot is EntityAgent not IPlayer, we manually filter drops by tool type.
+
+---
+*Last updated: Session 23 - Fixed bot_use_tool to handle tool-specific drops (tallgrass with knife) correctly. Discovered that tallgrass uses drops array with tool filter, NOT BlockBehaviorHarvestable.*
