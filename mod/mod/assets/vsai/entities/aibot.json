@@ -17,7 +17,7 @@
     "climbTouchDistance": 0.5,
     "rotateTpOnSelf": true,
     "client": {
-        "renderer": "Shape",
+        "renderer": "AiBotRenderer",
         "shape": {
             "base": "entity/humanoid/trader"
         },

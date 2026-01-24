@@ -8,6 +8,7 @@ namespace vsai;
 /// Custom inventory behavior for the AI bot with expanded slot count and hand slots.
 /// Uses InventoryGeneric which allows any item in any slot, unlike SeraphInventory
 /// which reserves slots 0-14 for equipment.
+/// Hand items are synced via WatchedAttributes to allow client-side rendering.
 /// </summary>
 public class EntityBehaviorBotInventory : EntityBehavior
 {
@@ -30,6 +31,12 @@ public class EntityBehaviorBotInventory : EntityBehavior
     /// Default number of inventory slots for the bot.
     /// </summary>
     public const int DefaultSlotCount = 32;
+
+    /// <summary>
+    /// WatchedAttributes keys for hand item sync.
+    /// </summary>
+    public const string RightHandAttrKey = "rightHandItem";
+    public const string LeftHandAttrKey = "leftHandItem";
 
     private int _slotCount = DefaultSlotCount;
     private InventoryGeneric _handInventory = null!;
@@ -73,5 +80,54 @@ public class EntityBehaviorBotInventory : EntityBehavior
         // Slot 0 = right hand, Slot 1 = left hand
         RightHandSlot = _handInventory[0];
         LeftHandSlot = _handInventory[1];
+
+        // Register slot change handlers to sync to WatchedAttributes (server side only)
+        if (entity.Api.Side == EnumAppSide.Server)
+        {
+            _handInventory.SlotModified += OnHandSlotModified;
+        }
+    }
+
+    /// <summary>
+    /// Called when a hand slot is modified on the server.
+    /// Syncs the item to WatchedAttributes for client visibility.
+    /// </summary>
+    private void OnHandSlotModified(int slotIndex)
+    {
+        SyncHandSlotToWatchedAttributes(slotIndex);
+    }
+
+    /// <summary>
+    /// Syncs a hand slot to WatchedAttributes for client-side rendering.
+    /// </summary>
+    public void SyncHandSlotToWatchedAttributes(int slotIndex)
+    {
+        if (entity.Api.Side != EnumAppSide.Server) return;
+
+        string attrKey = slotIndex == 0 ? RightHandAttrKey : LeftHandAttrKey;
+        ItemSlot slot = slotIndex == 0 ? RightHandSlot : LeftHandSlot;
+
+        if (slot.Empty)
+        {
+            // Remove the attribute if slot is empty
+            entity.WatchedAttributes.RemoveAttribute(attrKey);
+        }
+        else
+        {
+            // Store the itemstack directly using SetItemstack
+            entity.WatchedAttributes.SetItemstack(attrKey, slot.Itemstack);
+        }
+
+        entity.WatchedAttributes.MarkPathDirty(attrKey);
+    }
+
+    /// <summary>
+    /// Syncs both hand slots to WatchedAttributes.
+    /// Call this after equipping items via the API.
+    /// </summary>
+    public void SyncAllHandSlots()
+    {
+        SyncHandSlotToWatchedAttributes(0);
+        SyncHandSlotToWatchedAttributes(1);
     }
 }
