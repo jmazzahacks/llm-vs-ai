@@ -138,4 +138,97 @@ Not all resources exist in all biomes:
 
 ---
 
+## Tool Crafting
+
+### Basic Tool Creation Pipeline
+
+To craft stone-age tools:
+
+1. **Collect materials:** Find flint (`bot_blocks` with `filter="flint"`) and sticks (`filter="stick"`)
+2. **Knap a tool head:** `bot_knap(recipe="knife")` - requires flint in inventory
+3. **Craft the tool:** `bot_craft(recipe="knife")` - combines blade + stick
+4. **Equip the tool:** `bot_equip(itemCode="knife")`
+
+**Available knapping recipes:** `axe`, `knife`, `shovel`, `hoe`, `spear`, `arrowhead`
+
+### Knapping Location
+
+Knapping creates a temporary work surface on the ground. If you get "position blocked" error:
+- Move to a clear area (no tallgrass, items, or other blocks)
+- Try again after moving a few blocks
+
+---
+
+## Tool Usage (Harvesting)
+
+### Using bot_use_tool
+
+`bot_use_tool` simulates left-click with equipped tool. Different tools harvest different blocks:
+
+| Tool | Block | Result |
+|------|-------|--------|
+| Knife | Tallgrass | Dry grass |
+| Knife | Cattail | Cattail root |
+| Axe | Log | Strip bark |
+| Hoe | Soil | Farmland |
+
+### Harvesting Workflow
+
+Example: Collecting dry grass with a knife
+
+1. **Equip knife:** `bot_equip(itemCode="knife")`
+2. **Find tallgrass:** `bot_blocks(radius=10, filter="tallgrass")`
+3. **Harvest:** `bot_use_tool(x, y, z)` - block becomes air, item drops
+4. **Pickup:** `bot_pickup()` - collects nearby dropped items
+5. **Repeat** until you have enough
+
+**Note:** Items drop as entities, not directly to inventory. Always `bot_pickup` after harvesting.
+
+### Efficient Harvesting
+
+- Harvest multiple blocks before picking up (items persist for a while)
+- Use `bot_entities(radius=10)` to see dropped items
+- `bot_pickup` grabs the nearest item - call multiple times for multiple drops
+
+---
+
+## Block Interaction
+
+### Doors and Gates
+
+Use `bot_interact` to open/close doors and gates:
+
+```
+bot_interact(x, y, z)  # Toggle door state
+```
+
+Works on: doors, gates, trapdoors, levers
+
+### Finding Interactable Blocks
+
+Search with `bot_blocks`:
+- `filter="door"` - Find doors
+- `filter="gate"` - Find fence gates
+- `filter="lever"` - Find levers
+
+---
+
+## Item Management
+
+### Dropping Items
+
+Use `bot_inventory_drop` to drop items:
+- `bot_inventory_drop(itemCode="drygrass")` - Drop 1 dry grass
+- `bot_inventory_drop(slotIndex=0)` - Drop from specific slot
+
+**Note:** Each call drops 1 item. Call multiple times to drop stacks.
+
+### Checking Inventory
+
+`bot_inventory` shows:
+- `handRight` / `handLeft` - Currently equipped items
+- `slots` - All inventory slots with item codes and quantities
+
+---
+
 *Add new tips as you discover them!*
