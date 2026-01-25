@@ -6,17 +6,16 @@ This document contains tips and strategies for AI agents controlling bots in Vin
 
 ## Navigation & Movement
 
-### CRITICAL: Follow Pathfinder Waypoints Sequentially
+### Using bot_goto
 
-When using `bot_pathfind` + `bot_walk`:
+`bot_goto` uses the game's built-in A* pathfinding (NavigateTo). It routes around obstacles and hazards automatically.
 
-1. Call `bot_pathfind` to get safe waypoints
-2. Walk to EACH waypoint in sequence - do NOT skip to the final destination
-3. The pathfinder routes around cliffs and hazards; skipping waypoints bypasses safety
+```
+bot_goto(x, y, z)  # Absolute coordinates
+bot_goto(x, y, z, relative=True)  # Relative to bot position
+```
 
-**WRONG:** Pathfind returns 30 waypoints, walk directly to final waypoint → bot walks off cliff and dies from fall damage
-
-**CORRECT:** Walk through waypoints in order, or in small batches
+The bot will walk to the destination, blocking until it arrives or gets stuck.
 
 ### Getting Unstuck
 
@@ -42,25 +41,11 @@ When pathfinding fails or the bot gets stuck:
 - If stuck at a doorway, ask the player to widen it
 - When building structures, always make doorways at least 2 blocks wide
 
-### DANGER: Never Use Direct Walk in Unknown Terrain
+### When Pathfinding Fails
 
-**`bot_walk` bypasses A* pathfinding entirely** - it walks in a straight line toward the target with no hazard detection.
+If `bot_goto` fails repeatedly, don't try to force it. The pathfinder is often failing because the terrain IS dangerous. Instead:
 
-**When NOT to use `bot_walk`:**
-- In unexplored terrain
-- When pathfinding repeatedly fails (this often means the terrain is dangerous!)
-- Near cliffs, ravines, or holes
-- When you can't visually confirm the path is clear
-
-**When `bot_walk` is safe:**
-- Following a path you've already confirmed with pathfinding
-- Short distances on flat, visible terrain
-- As a last resort when truly stuck (but expect potential falls)
-
-**Lesson learned:** During a long-distance test, pathfinding kept failing in difficult terrain. Using `bot_walk` as a fallback resulted in the bot falling into a deep hole (23-block drop). The pathfinder was failing because the terrain WAS dangerous - it was doing its job by refusing to find a path through hazardous areas.
-
-**If pathfinding fails repeatedly:** Don't bypass it. Instead:
-1. Try a different direction
+1. Try a different direction or route
 2. Backtrack to safer terrain
 3. Ask for player assistance
 4. Accept that some terrain is impassable
@@ -261,7 +246,7 @@ This tells you:
 | Item | Recipe Name | Ingredients |
 |------|-------------|-------------|
 | Crude door | `door-crude` | axe + 2 logs + 3 sticks |
-| Firewood | `firewood` | axe + log (WARNING: consumes axe!) |
+| Firewood | `firewood` | axe + log |
 | Rough-hewn fence | `roughhewn` | axe + logs + sticks |
 | Flint axe | `axe` | axehead-flint + stick |
 | Flint knife | `knife` | knifeblade-flint + stick |
