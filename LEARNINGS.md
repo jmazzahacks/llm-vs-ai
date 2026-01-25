@@ -1085,6 +1085,54 @@ curl -X POST http://localhost:4560/bot/craft \
 
 **MCP Tool:** `bot_craft(recipe="axe")` - Works for combining tool heads with sticks, etc.
 
+### Tool Ingredients (IsTool Property) - FIXED!
+
+**Problem:** Recipes like firewood (axe + log) were consuming the axe instead of just reducing its durability.
+
+**Root cause:** The `bot_craft` handler was consuming ALL ingredients without checking if they were tools.
+
+**Solution:** Check `CraftingRecipeIngredient.IsTool` property - if true, reduce durability instead of consuming:
+
+```csharp
+foreach (var (slotIdx, ingredient) in ingredientSlots)
+{
+    var slot = inventory[slotIdx];
+    if (slot?.Itemstack != null)
+    {
+        if (ingredient.IsTool)
+        {
+            // Tool ingredient: reduce durability instead of consuming
+            int durabilityCost = ingredient.ToolDurabilityCost > 0 ? ingredient.ToolDurabilityCost : 1;
+            slot.Itemstack.Collectible.DamageItem(_serverApi.World, agent, slot, durabilityCost);
+            // Check if tool broke from durability loss
+            if (slot.Itemstack?.Collectible?.GetRemainingDurability(slot.Itemstack) <= 0)
+            {
+                slot.Itemstack = null;
+            }
+        }
+        else
+        {
+            // Regular ingredient: consume it
+            int consumeQty = ingredient.Quantity;
+            slot.Itemstack.StackSize -= consumeQty;
+            if (slot.Itemstack.StackSize <= 0)
+            {
+                slot.Itemstack = null;
+            }
+        }
+        slot.MarkDirty();
+    }
+}
+```
+
+**Key properties:**
+- `ingredient.IsTool` - boolean, true if ingredient is a tool that shouldn't be consumed
+- `ingredient.ToolDurabilityCost` - int, durability to reduce (defaults to 1)
+- `Collectible.DamageItem(world, entity, slot, amount)` - reduces durability
+- `Collectible.GetRemainingDurability(stack)` - check if tool broke
+
+**Reference:** [CraftingRecipeIngredient API](https://apidocs.vintagestory.at/api/Vintagestory.API.Common.CraftingRecipeIngredient.html)
+
 **Phase 2: Knapping** - IMPLEMENTED & TESTED!
 
 The `/bot/knap` endpoint allows the bot to craft flint/stone tools instantly:

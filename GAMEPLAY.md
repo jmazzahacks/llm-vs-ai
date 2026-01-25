@@ -35,6 +35,13 @@ When pathfinding fails or the bot gets stuck:
 - **Short-distance goto (10 blocks):** More reliable, pathfinding explores more thoroughly
 - **Strategy:** For long journeys, consider breaking into shorter segments if you encounter stuck issues
 
+### Doorway Width Requirements
+
+**CRITICAL:** The bot pathfinder requires **2+ block wide doorways** to navigate through. Single-block doorways are too narrow - the pathfinder's collision margin prevents routing through them.
+
+- If stuck at a doorway, ask the player to widen it
+- When building structures, always make doorways at least 2 blocks wide
+
 ### DANGER: Never Use Direct Walk in Unknown Terrain
 
 **`bot_walk` bypasses A* pathfinding entirely** - it walks in a straight line toward the target with no hazard detection.
@@ -204,12 +211,60 @@ bot_interact(x, y, z)  # Toggle door state
 
 Works on: doors, gates, trapdoors, levers
 
+### Door Placement Tips
+
+- **Door position matters:** Doors need to be placed at the correct Z coordinate to align with walls. Experiment if doors appear floating.
+- **Double doors:** When two doors are placed adjacent to each other at the same Z coordinate, they link together - opening one opens both!
+- **Hinge side:** The hinge position depends on placement. If a door swings the wrong way, the player may need to manually reposition it.
+
 ### Finding Interactable Blocks
 
 Search with `bot_blocks`:
 - `filter="door"` - Find doors
 - `filter="gate"` - Find fence gates
 - `filter="lever"` - Find levers
+
+---
+
+## Crafting Recipes
+
+### Recipe Naming Convention
+
+**CRITICAL:** Vintage Story recipe names follow `item-variant` pattern, NOT natural language!
+
+| You might try | Actual recipe name |
+|---------------|-------------------|
+| "crude door" | `door-crude` |
+| "flint knife" | `knife` (variant is auto-matched) |
+| "wooden door" | Check with `bot_craft` |
+
+### Discovering Recipe Names
+
+If you don't know the exact recipe name, try crafting with a guess - the error message reveals available recipes:
+
+```
+bot_craft(recipe="door")
+→ Error: Found 110 'door' recipes but missing ingredients:
+  door-crude (needs axe-* + stick + log-placed-*-ud + stick + log-placed-*-ud + stick), ...
+```
+
+This tells you:
+1. The exact recipe name: `door-crude`
+2. The required ingredients: axe, 3 sticks, 2 logs
+
+### Important Crafting Notes
+
+- **Tools in hand vs inventory:** The crafting system only sees items in inventory slots, NOT items equipped in hand. If crafting fails due to missing ingredients, swap your equipped tool into inventory first using `bot_equip` to swap something else into your hand.
+
+### Common Recipe Names
+
+| Item | Recipe Name | Ingredients |
+|------|-------------|-------------|
+| Crude door | `door-crude` | axe + 2 logs + 3 sticks |
+| Firewood | `firewood` | axe + log (WARNING: consumes axe!) |
+| Rough-hewn fence | `roughhewn` | axe + logs + sticks |
+| Flint axe | `axe` | axehead-flint + stick |
+| Flint knife | `knife` | knifeblade-flint + stick |
 
 ---
 
@@ -228,6 +283,17 @@ Use `bot_inventory_drop` to drop items:
 `bot_inventory` shows:
 - `handRight` / `handLeft` - Currently equipped items
 - `slots` - All inventory slots with item codes and quantities
+
+---
+
+## Known Locations
+
+### My House (Packed Dirt House)
+
+- **Absolute:** (511896, 110, 511998)
+- **Relative (player coords):** (-104, 110, -2)
+- **Doorway:** North side, double crude doors at x=511895-511896, z=511994
+- **Description:** Packed dirt house I built. Has linked double doors that open together.
 
 ---
 

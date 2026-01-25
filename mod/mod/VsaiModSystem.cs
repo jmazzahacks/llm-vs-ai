@@ -348,18 +348,6 @@ public class VsaiModSystem : ModSystem
                     responseBody = HandleBotObserveEntities(request);
                     break;
 
-                case "/bot/break":
-                    if (method != "POST")
-                    {
-                        statusCode = 405;
-                        responseBody = JsonError("Method not allowed. Use POST.");
-                    }
-                    else
-                    {
-                        responseBody = HandleBotBreakBlock(request);
-                    }
-                    break;
-
                 case "/bot/mine":
                     if (method != "POST")
                     {
@@ -1135,132 +1123,6 @@ public class VsaiModSystem : ModSystem
             entityCount = entities.Count,
             entities = entities
         });
-    }
-
-    private string HandleBotBreakBlock(HttpListenerRequest request)
-    {
-        if (_botEntity == null || !_botEntity.Alive)
-        {
-            return JsonError("No active bot");
-        }
-
-        var body = ReadRequestBody(request);
-        if (string.IsNullOrEmpty(body))
-        {
-            return JsonError("Empty request body. Provide x, y, z block coordinates.");
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            var root = doc.RootElement;
-
-            int x, y, z;
-
-            // Support relative coordinates from bot position
-            if (root.TryGetProperty("relative", out var relative) && relative.GetBoolean())
-            {
-                var botBlockPos = _botEntity.ServerPos.AsBlockPos;
-                int dx = root.TryGetProperty("x", out var dxEl) ? dxEl.GetInt32() : 0;
-                int dy = root.TryGetProperty("y", out var dyEl) ? dyEl.GetInt32() : 0;
-                int dz = root.TryGetProperty("z", out var dzEl) ? dzEl.GetInt32() : 0;
-
-                x = botBlockPos.X + dx;
-                y = botBlockPos.Y + dy;
-                z = botBlockPos.Z + dz;
-            }
-            else
-            {
-                if (!root.TryGetProperty("x", out var xEl) ||
-                    !root.TryGetProperty("y", out var yEl) ||
-                    !root.TryGetProperty("z", out var zEl))
-                {
-                    return JsonError("Missing x, y, or z coordinates");
-                }
-
-                x = xEl.GetInt32();
-                y = yEl.GetInt32();
-                z = zEl.GetInt32();
-            }
-
-            var blockAccessor = _serverApi?.World?.BlockAccessor;
-            if (blockAccessor == null)
-            {
-                return JsonError("World not available");
-            }
-
-            var blockPos = new BlockPos(x, y, z, _botEntity.ServerPos.Dimension);
-            var block = blockAccessor.GetBlock(blockPos);
-
-            if (block == null || block.Code?.Path == "air")
-            {
-                return JsonError($"No block at position ({x}, {y}, {z})");
-            }
-
-            string blockCode = block.Code?.Path ?? "unknown";
-            var drops = new List<string>();
-
-            var waitHandle = new ManualResetEventSlim(false);
-            string? errorMsg = null;
-
-            _serverApi?.Event.EnqueueMainThreadTask(() =>
-            {
-                try
-                {
-                    // Get drops before breaking
-                    var blockDrops = block.GetDrops(_serverApi.World, blockPos, null);
-                    if (blockDrops != null)
-                    {
-                        foreach (var drop in blockDrops)
-                        {
-                            drops.Add($"{drop.StackSize}x {drop.Collectible?.Code?.Path ?? "unknown"}");
-                        }
-                    }
-
-                    // Break the block (set to air)
-                    blockAccessor.SetBlock(0, blockPos);
-                    blockAccessor.TriggerNeighbourBlockUpdate(blockPos);
-
-                    // Spawn drops as items in the world
-                    if (blockDrops != null)
-                    {
-                        foreach (var drop in blockDrops)
-                        {
-                            _serverApi.World.SpawnItemEntity(drop, new Vec3d(x + 0.5, y + 0.5, z + 0.5));
-                        }
-                    }
-
-                    _serverApi.Logger.Debug($"[VSAI] Bot broke block {blockCode} at ({x}, {y}, {z})");
-                }
-                catch (Exception ex)
-                {
-                    errorMsg = ex.Message;
-                }
-                finally
-                {
-                    waitHandle.Set();
-                }
-            }, "VSAI-BreakBlock");
-
-            waitHandle.Wait(2000);
-
-            if (errorMsg != null)
-            {
-                return JsonError(errorMsg);
-            }
-
-            return JsonSerializer.Serialize(new
-            {
-                success = true,
-                brokenBlock = blockCode,
-                position = new { x, y, z },
-                drops = drops
-            });
-        }
-        catch (JsonException ex)
-        {
-            return JsonError($"Invalid JSON: {ex.Message}");
-        }
     }
 
     /// <summary>
@@ -3473,17 +3335,32 @@ public class VsaiModSystem : ModSystem
         {
             try
             {
-                // Consume ingredients
+                // Consume ingredients (or reduce durability for tools)
                 foreach (var (slotIdx, ingredient) in ingredientSlots)
                 {
                     var slot = inventory[slotIdx];
                     if (slot?.Itemstack != null)
                     {
-                        int consumeQty = ingredient.Quantity;
-                        slot.Itemstack.StackSize -= consumeQty;
-                        if (slot.Itemstack.StackSize <= 0)
+                        if (ingredient.IsTool)
                         {
-                            slot.Itemstack = null;
+                            // Tool ingredient: reduce durability instead of consuming
+                            int durabilityCost = ingredient.ToolDurabilityCost > 0 ? ingredient.ToolDurabilityCost : 1;
+                            slot.Itemstack.Collectible.DamageItem(_serverApi.World, agent, slot, durabilityCost);
+                            // Check if tool broke from durability loss
+                            if (slot.Itemstack?.Collectible?.GetRemainingDurability(slot.Itemstack) <= 0)
+                            {
+                                slot.Itemstack = null;
+                            }
+                        }
+                        else
+                        {
+                            // Regular ingredient: consume it
+                            int consumeQty = ingredient.Quantity;
+                            slot.Itemstack.StackSize -= consumeQty;
+                            if (slot.Itemstack.StackSize <= 0)
+                            {
+                                slot.Itemstack = null;
+                            }
                         }
                         slot.MarkDirty();
                     }

@@ -209,19 +209,6 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
-            name="bot_break",
-            description="Break a block at the specified position.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "x": {"type": "integer", "description": "Block X coordinate"},
-                    "y": {"type": "integer", "description": "Block Y coordinate"},
-                    "z": {"type": "integer", "description": "Block Z coordinate"}
-                },
-                "required": ["x", "y", "z"]
-            }
-        ),
-        Tool(
             name="bot_mine",
             description="Mine a block using equipped tool. Respects tool tier - drops only if tool tier >= block requirement. Bot should have appropriate tool equipped (pickaxe for stone/ore, axe for wood, etc.). Tool tiers: 0=none, 1=stone/flint, 2=copper, 3=bronze, 4=iron, 5=steel.",
             inputSchema={
@@ -599,13 +586,6 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     elif name == "bot_entities":
         radius = arguments.get("radius", 10)
         return http_get(f"/bot/entities?radius={radius}")
-
-    elif name == "bot_break":
-        return http_post("/bot/break", {
-            "x": arguments["x"],
-            "y": arguments["y"],
-            "z": arguments["z"]
-        })
 
     elif name == "bot_mine":
         return http_post("/bot/mine", {
