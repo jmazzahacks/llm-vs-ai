@@ -7,9 +7,14 @@ from players in-game via chat and executing them using Claude.
 """
 
 import asyncio
+import os
 import sys
 import httpx
+from dotenv import load_dotenv
 from claude_agent_sdk import query, ClaudeAgentOptions
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 # Configuration
