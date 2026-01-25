@@ -124,8 +124,7 @@ async def execute_command(player: str, command: str) -> None:
 Player: {player}
 Command: {command}
 
-First, announce via bot_chat that you received the command and what you're going to do.
-Then execute the command step by step, announcing your progress.
+Execute the command step by step.
 If you encounter problems, explain what happened and ask for help if needed.
 
 ## Gameplay Reference
