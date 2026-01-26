@@ -271,6 +271,100 @@ Use `bot_inventory_drop` to drop items:
 
 ---
 
+## Combat
+
+### Using bot_attack
+
+`bot_attack` performs a chase-and-attack sequence:
+1. Bot chases the target entity using pathfinding
+2. When in range, attacks with equipped weapon
+3. Repeats until target dies, escapes, or bot dies
+
+```
+bot_attack(entityId=12345)  # Attack entity with ID 12345
+bot_attack(entityId=12345, maxChaseDistance=15)  # Give up if target gets 15 blocks away
+```
+
+### Combat Workflow
+
+1. **Find targets:** `bot_entities(radius=20)` - lists nearby entities with IDs
+2. **Equip weapon:** `bot_equip(itemCode="spear")` or any melee weapon
+3. **Attack:** `bot_attack(entityId=<id>)`
+4. **Collect drops:** `bot_pickup()` after kill
+
+### Attack Results
+
+- `killed` - Target died
+- `escaped` - Target got beyond maxChaseDistance
+- `bot_died` - Bot was killed in combat
+- `timeout` - Combat took too long (30 seconds)
+
+### Weapon Stats (Tested)
+
+| Weapon | Damage | Range | Notes |
+|--------|--------|-------|-------|
+| Fist | 0.5 | 2.0 | Very slow kills, takes 29 hits for a shiver |
+| Flint Spear | 2.0 | 3.5 | Good range and damage, 11 hits for a deer |
+| Flint Knife | ~1.5 | 2.0 | Lower range than spear |
+
+### Target Selection
+
+**Easy targets (passive, won't fight back):**
+- Deer - flee but don't attack, drop meat
+- Rabbits - fast, may escape
+- Chickens - slow, easy kills
+
+**Dangerous targets (will fight back):**
+- Drifters (shiver, bowtorn) - hostile mobs that attack
+- Wolves, bears - very dangerous
+- Locusts - flying enemies
+
+### Combat Tips
+
+1. **Check health before fighting:** `bot_observe` shows current HP. Don't engage if low.
+
+2. **Weapons matter a LOT:**
+   - Fist (0.5 dmg) vs Spear (2.0 dmg) = 4x damage difference
+   - 29 hits with fist vs 11 hits with spear to kill similar enemies
+
+3. **Enemies fight back:** When attacking a shiver with fists, the bot took ~12 damage (from 20 HP to 8 HP). Better weapons = faster kills = less damage taken.
+
+4. **Passive animals flee:** Deer will run away. Use higher `maxChaseDistance` (50+) to pursue.
+
+5. **No looting corpses yet:** Corpses require a knife to butcher (entity interaction not yet implemented). Drops from kills appear as item entities that can be picked up with `bot_pickup`.
+
+### Hunting Workflow Example
+
+```
+# 1. Equip spear
+bot_equip(itemCode="spear")
+
+# 2. Find targets
+bot_entities(radius=40)
+# Returns: deer at entityId=205644, distance=40 blocks
+
+# 3. Hunt the deer
+bot_attack(entityId=205644, maxChaseDistance=60)
+# Returns: "killed" after 11 attacks, 22 damage dealt
+
+# 4. Check for drops
+bot_entities(radius=5)  # Look for item entities
+bot_pickup()  # Pick up any drops
+```
+
+### Crafting a Hunting Weapon
+
+Quickest path to a flint spear:
+
+1. **Find flint:** `bot_blocks(radius=20, filter="flint")` - look for `looseflints-*`
+2. **Collect flint:** `bot_collect(x, y, z)` then `bot_pickup()`
+3. **Find sticks:** `bot_blocks(radius=20, filter="stick,branch")` - mine branchy leaves
+4. **Knap spear head:** `bot_knap(recipe="spear")` - needs clear ground
+5. **Craft spear:** `bot_craft(recipe="spear")` - combines head + stick
+6. **Equip:** `bot_equip(itemCode="spear")`
+
+---
+
 ## Known Locations
 
 ### My House (Packed Dirt House)

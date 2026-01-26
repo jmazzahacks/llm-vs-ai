@@ -52,14 +52,14 @@ def http_get(endpoint: str) -> dict[str, Any]:
         return json.loads(response.read().decode())
 
 
-def http_post(endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
+def http_post(endpoint: str, data: dict[str, Any], timeout: int = 10) -> dict[str, Any]:
     """Make a POST request to the VS API with JSON body."""
     url = f"{VS_API_BASE_URL}{endpoint}"
     body = json.dumps(data).encode()
     req = Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
 
-    with urlopen(req, timeout=10) as response:
+    with urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode())
 
 
@@ -437,12 +437,31 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["x", "y", "z"]
             }
+        ),
+        Tool(
+            name="bot_attack",
+            description="Chase and attack a target entity with equipped melee weapon. Bot will pursue the target and attack until it dies or escapes. Use bot_entities first to find target IDs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entityId": {
+                        "type": "integer",
+                        "description": "Target entity ID (from bot_entities)"
+                    },
+                    "maxChaseDistance": {
+                        "type": "number",
+                        "default": 30,
+                        "description": "Give up if target gets this far away (default: 30)"
+                    }
+                },
+                "required": ["entityId"]
+            }
         )
     ]
 
 
 # Tools that have blocking wait loops and need to run in a thread
-BLOCKING_TOOLS = {"bot_goto"}
+BLOCKING_TOOLS = {"bot_goto", "bot_attack"}
 
 
 @server.call_tool()
@@ -702,6 +721,13 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "z": arguments["z"],
             "relative": arguments.get("relative", False)
         })
+
+    elif name == "bot_attack":
+        # Longer timeout for combat operations (60 second combat + buffer)
+        return http_post("/bot/attack", {
+            "entityId": arguments["entityId"],
+            "maxChaseDistance": arguments.get("maxChaseDistance", 30)
+        }, timeout=65)
 
     else:
         return {"error": f"Unknown tool: {name}"}

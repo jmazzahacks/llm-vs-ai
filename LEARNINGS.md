@@ -2265,4 +2265,164 @@ bot_use_tool(x=1, y=0, z=1, relative=True)           # Relative to bot
 4. **GetDrops limitation:** `Block.GetDrops()` doesn't take a tool parameter - it checks the player's tool. Since our bot is EntityAgent not IPlayer, we manually filter drops by tool type.
 
 ---
-*Last updated: Session 23 - Fixed bot_use_tool to handle tool-specific drops (tallgrass with knife) correctly. Discovered that tallgrass uses drops array with tool filter, NOT BlockBehaviorHarvestable.*
+
+## Bot Combat (Melee Attack) - IMPLEMENTED!
+
+### Overview
+
+The `/bot/attack` endpoint allows the bot to chase and attack a target entity with equipped melee weapons. The bot will pursue the target and attack until it dies, escapes beyond chase distance, or the bot dies.
+
+### Key Implementation Challenge: Threading
+
+**Initial Problem:** The first implementation used a while loop with `Thread.Sleep()` inside an `EnqueueMainThreadTask()` callback:
+
+```csharp
+// WRONG - blocks the main game thread!
+_serverApi?.Event.EnqueueMainThreadTask(() => {
+    while (iteration < maxIterations) {
+        // Check state, attack, chase...
+        Thread.Sleep(100);  // <-- FREEZES THE GAME!
+    }
+}, "VSAI-Attack");
+```
+
+**Result:** Server log showed "Server overloaded. A tick took 30235ms to complete." - the game froze for 30 seconds while the combat loop ran.
+
+**Solution:** Run the combat loop in a **background thread**, dispatching only game state operations to the main thread:
+
+```csharp
+var combatThread = new Thread(() => {
+    while (iteration < maxIterations) {
+        // Check state on main thread (fast operation)
+        var stateHandle = new ManualResetEventSlim(false);
+        _serverApi?.Event.EnqueueMainThreadTask(() => {
+            botAlive = _botEntity?.Alive ?? false;
+            targetAlive = targetEntity?.Alive ?? false;
+            distance = _botEntity.ServerPos.XYZ.DistanceTo(targetEntity.ServerPos.XYZ);
+            stateHandle.Set();
+        }, "VSAI-CheckState");
+        stateHandle.Wait(1000);
+
+        // Attack on main thread (fast operation)
+        if (inRange) {
+            _serverApi?.Event.EnqueueMainThreadTask(() => {
+                targetEntity.ReceiveDamage(damageSource, attackPower);
+            }, "VSAI-Attack");
+        }
+
+        // Sleep in background thread - doesn't block game!
+        Thread.Sleep(100);
+    }
+});
+combatThread.IsBackground = true;
+combatThread.Start();
+```
+
+### Combat Mechanics
+
+**Damage Application:**
+```csharp
+var damageSource = new DamageSource {
+    Type = EnumDamageType.BluntAttack,  // or PiercingAttack, SlashingAttack
+    SourceEntity = _botEntity,
+    CauseEntity = _botEntity,
+    KnockbackStrength = 0.3f
+};
+
+bool hit = targetEntity.ReceiveDamage(damageSource, attackPower);
+```
+
+**Weapon Stats:**
+```csharp
+var toolSlot = agent.RightHandItemSlot;
+var toolStack = toolSlot?.Itemstack;
+
+float attackPower = 0.5f;  // Fist damage default
+float attackRange = 2.0f;  // Default range
+
+if (toolStack?.Collectible != null) {
+    attackPower = toolStack.Collectible.GetAttackPower(toolStack);
+    attackRange = toolStack.Collectible.AttackRange > 0
+        ? toolStack.Collectible.AttackRange
+        : 2.0f;
+}
+```
+
+**Weapon Comparison (Tested):**
+| Weapon | Damage | Range | Hits to Kill |
+|--------|--------|-------|--------------|
+| Fist | 0.5 | 2.0 | 29 (shiver) |
+| Flint Spear | 2.0 | 3.5 | 11 (deer) |
+
+### API Endpoint
+
+```bash
+curl -X POST http://localhost:4560/bot/attack \
+  -H "Content-Type: application/json" \
+  -d '{"entityId": 12345, "maxChaseDistance": 30}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "result": "killed",
+  "message": "Killed deer-whitetail-adult-male after 11 attacks",
+  "damageDealt": 22,
+  "attackCount": 11,
+  "targetHealth": 0,
+  "weapon": "spear-generic-flint",
+  "attackPower": 2,
+  "attackRange": 3.5
+}
+```
+
+**Result Values:**
+- `killed` - Target died
+- `escaped` - Target got beyond maxChaseDistance
+- `bot_died` - Bot was killed during combat
+- `timeout` - Combat took too long (30 seconds)
+
+### Entity Health Helper
+
+```csharp
+private float GetEntityHealth(Entity entity)
+{
+    var healthBehavior = entity.GetBehavior<EntityBehaviorHealth>();
+    return healthBehavior?.Health ?? 0;
+}
+```
+
+### MCP Tool
+
+Added to `BLOCKING_TOOLS` set since it can take up to 60 seconds:
+
+```python
+BLOCKING_TOOLS = {"bot_goto", "bot_attack"}
+
+# Handler with extended timeout
+elif name == "bot_attack":
+    return http_post("/bot/attack", {
+        "entityId": arguments["entityId"],
+        "maxChaseDistance": arguments.get("maxChaseDistance", 30)
+    }, timeout=65)  # 60 second combat + buffer
+```
+
+### Key Learnings
+
+1. **Never use Thread.Sleep on main thread** - Blocks the entire game
+2. **Use background threads for loops** - Dispatch individual operations to main thread
+3. **ManualResetEventSlim for sync** - Wait for main thread operations to complete
+4. **Enemies fight back** - Bot took ~12 damage from shiver during 29-hit fist fight
+5. **Better weapons = faster kills** - Spear (2 dmg) vs fist (0.5 dmg) = 4x faster
+
+### Missing Feature: Entity Interaction (Butchering)
+
+**Discovered limitation:** The bot cannot butcher corpses (interact with entities). Current tools only work on blocks:
+- `bot_interact` - Block activation (doors, gates)
+- `bot_use_tool` - Block harvesting (tallgrass with knife)
+
+Butchering a corpse requires right-clicking on an **entity** with a knife equipped. Would need a new `/bot/interact_entity` endpoint.
+
+---
+*Last updated: Session 24 - Implemented bot_attack for melee combat. Fixed critical threading bug (Thread.Sleep on main thread). Successfully tested hunting deer with flint spear.*

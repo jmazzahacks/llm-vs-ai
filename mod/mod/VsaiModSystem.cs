@@ -396,6 +396,18 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/attack":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotAttack(request);
+                    }
+                    break;
+
                 case "/bot/stop":
                     if (method != "POST")
                     {
@@ -1569,6 +1581,285 @@ public class VsaiModSystem : ModSystem
         {
             return JsonError($"Invalid JSON: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Chase and attack a target entity with equipped melee weapon.
+    /// </summary>
+    private string HandleBotAttack(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide entityId.");
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("entityId", out var entityIdEl))
+            {
+                return JsonError("Missing entityId parameter");
+            }
+
+            long targetEntityId = entityIdEl.GetInt64();
+            float maxChaseDistance = 30f;
+            if (root.TryGetProperty("maxChaseDistance", out var maxDistEl))
+            {
+                maxChaseDistance = maxDistEl.GetSingle();
+            }
+
+            // Find target entity on main thread
+            Entity? targetEntity = null;
+            string? findError = null;
+            var findHandle = new ManualResetEventSlim(false);
+
+            _serverApi?.Event.EnqueueMainThreadTask(() =>
+            {
+                var nearbyEntities = _serverApi?.World?.GetEntitiesAround(
+                    _botEntity.ServerPos.XYZ, 100f, 100f,
+                    e => e.EntityId == targetEntityId
+                );
+                if (nearbyEntities != null && nearbyEntities.Any())
+                {
+                    targetEntity = nearbyEntities.First();
+                }
+                if (targetEntity == null)
+                {
+                    findError = $"Entity {targetEntityId} not found within 100 blocks";
+                }
+                else if (!targetEntity.Alive)
+                {
+                    findError = $"Entity {targetEntityId} is already dead";
+                }
+                findHandle.Set();
+            }, "VSAI-FindTarget");
+
+            findHandle.Wait(5000);
+
+            if (findError != null)
+            {
+                return JsonError(findError);
+            }
+
+            if (targetEntity == null)
+            {
+                return JsonError("Failed to find target entity");
+            }
+
+            // Get weapon info
+            var toolSlot = agent.RightHandItemSlot;
+            var toolStack = toolSlot?.Itemstack;
+            float attackPower = 0.5f;  // Fist damage
+            float attackRange = 2.0f;
+            string weaponCode = "fist";
+
+            if (toolStack?.Collectible != null)
+            {
+                attackPower = toolStack.Collectible.GetAttackPower(toolStack);
+                attackRange = toolStack.Collectible.AttackRange > 0
+                    ? toolStack.Collectible.AttackRange
+                    : 2.0f;
+                weaponCode = toolStack.Collectible.Code?.Path ?? "unknown";
+            }
+
+            // Chase-attack state - shared between threads
+            string result = "error";
+            string message = "";
+            float totalDamage = 0;
+            int attackCount = 0;
+            float targetHealth = 0;
+            string targetCode = targetEntity.Code?.Path ?? "unknown";
+            var completionHandle = new ManualResetEventSlim(false);
+            long lastAttackTime = 0;
+            long attackCooldownMs = 500;
+
+            // Run chase-attack loop in background thread, dispatch actions to main thread
+            var combatThread = new Thread(() =>
+            {
+                try
+                {
+                    int maxIterations = 300;  // ~30 seconds at 100ms check rate
+                    int iteration = 0;
+
+                    while (iteration < maxIterations)
+                    {
+                        iteration++;
+
+                        // Variables to capture from main thread
+                        bool botAlive = false;
+                        bool targetAlive = false;
+                        double distance = 0;
+                        Vec3d? targetPos = null;
+
+                        // Check state on main thread
+                        var stateHandle = new ManualResetEventSlim(false);
+                        _serverApi?.Event.EnqueueMainThreadTask(() =>
+                        {
+                            botAlive = _botEntity?.Alive ?? false;
+                            targetAlive = targetEntity?.Alive ?? false;
+                            if (botAlive && _botEntity != null && targetEntity != null)
+                            {
+                                distance = _botEntity.ServerPos.XYZ.DistanceTo(targetEntity.ServerPos.XYZ);
+                                targetPos = targetEntity.ServerPos.XYZ.Clone();
+                            }
+                            stateHandle.Set();
+                        }, "VSAI-CheckState");
+                        stateHandle.Wait(1000);
+
+                        // Check if bot died
+                        if (!botAlive)
+                        {
+                            result = "bot_died";
+                            message = "Bot died during combat";
+                            break;
+                        }
+
+                        // Check if target died
+                        if (!targetAlive)
+                        {
+                            result = "killed";
+                            message = $"Killed {targetCode} after {attackCount} attacks";
+                            break;
+                        }
+
+                        // Check if target escaped
+                        if (distance > maxChaseDistance)
+                        {
+                            result = "escaped";
+                            message = $"Target escaped beyond {maxChaseDistance} blocks (distance: {distance:F1})";
+                            // Get final health
+                            var healthHandle = new ManualResetEventSlim(false);
+                            _serverApi?.Event.EnqueueMainThreadTask(() =>
+                            {
+                                targetHealth = GetEntityHealth(targetEntity);
+                                healthHandle.Set();
+                            }, "VSAI-GetHealth");
+                            healthHandle.Wait(1000);
+                            break;
+                        }
+
+                        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                        // In range - attack!
+                        if (distance <= attackRange + 0.5 && (now - lastAttackTime) >= attackCooldownMs)
+                        {
+                            var attackHandle = new ManualResetEventSlim(false);
+                            bool hit = false;
+
+                            _serverApi?.Event.EnqueueMainThreadTask(() =>
+                            {
+                                var damageSource = new DamageSource
+                                {
+                                    Type = EnumDamageType.BluntAttack,
+                                    SourceEntity = _botEntity,
+                                    CauseEntity = _botEntity,
+                                    KnockbackStrength = 0.3f
+                                };
+
+                                hit = targetEntity.ReceiveDamage(damageSource, attackPower);
+                                attackHandle.Set();
+                            }, "VSAI-Attack");
+
+                            attackHandle.Wait(1000);
+
+                            if (hit)
+                            {
+                                totalDamage += attackPower;
+                                attackCount++;
+                                lastAttackTime = now;
+                                _serverApi?.Logger.Debug($"[VSAI] Attack hit! Damage: {attackPower}, Total: {totalDamage}");
+                            }
+                        }
+                        else if (distance > attackRange + 0.5 && targetPos != null)
+                        {
+                            // Out of range - chase (update target position)
+                            _serverApi?.Event.EnqueueMainThreadTask(() =>
+                            {
+                                var task = GetRemoteControlTask();
+                                task?.SetTarget(targetPos, 0.04f);
+                            }, "VSAI-Chase");
+                        }
+
+                        // Wait before next iteration (in background thread, not main thread)
+                        Thread.Sleep(100);
+                    }
+
+                    if (iteration >= maxIterations && result == "error")
+                    {
+                        result = "timeout";
+                        message = "Combat timed out after 30 seconds";
+                        var healthHandle = new ManualResetEventSlim(false);
+                        _serverApi?.Event.EnqueueMainThreadTask(() =>
+                        {
+                            targetHealth = GetEntityHealth(targetEntity);
+                            healthHandle.Set();
+                        }, "VSAI-GetHealth");
+                        healthHandle.Wait(1000);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    result = "error";
+                    message = ex.Message;
+                    _serverApi?.Logger.Error($"[VSAI] Attack error: {ex.Message}\n{ex.StackTrace}");
+                }
+                finally
+                {
+                    // Stop movement when combat ends
+                    _serverApi?.Event.EnqueueMainThreadTask(() =>
+                    {
+                        var task = GetRemoteControlTask();
+                        task?.Stop();
+                    }, "VSAI-StopCombat");
+                    completionHandle.Set();
+                }
+            });
+
+            combatThread.IsBackground = true;
+            combatThread.Start();
+
+            // Wait for combat to complete (up to 60 seconds)
+            completionHandle.Wait(TimeSpan.FromSeconds(60));
+
+            return JsonSerializer.Serialize(new
+            {
+                success = result == "killed",
+                result,
+                message,
+                damageDealt = totalDamage,
+                attackCount,
+                targetHealth,
+                weapon = weaponCode,
+                attackPower,
+                attackRange
+            });
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Get the current health of an entity.
+    /// </summary>
+    private float GetEntityHealth(Entity entity)
+    {
+        var healthBehavior = entity.GetBehavior<EntityBehaviorHealth>();
+        return healthBehavior?.Health ?? 0;
     }
 
     private string HandleBotPlaceBlock(HttpListenerRequest request)
