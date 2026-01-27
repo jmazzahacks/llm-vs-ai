@@ -65,7 +65,7 @@ def http_post(endpoint: str, data: dict[str, Any], timeout: int = 10) -> dict[st
 
 def wait_for_movement_complete() -> dict[str, Any]:
     """
-    Poll movement status until the bot reaches destination or gets stuck.
+    Poll movement status until the bot reaches destination, gets stuck, or is interrupted.
     Returns the final movement status.
     """
     terminal_states = {"idle", "reached", "stuck", "no_task"}
@@ -82,6 +82,19 @@ def wait_for_movement_complete() -> dict[str, Any]:
 
         if "error" in status:
             return status
+
+        # Check for combat interrupt - return immediately so agent can respond
+        interrupted_value = status.get("interrupted")
+        if interrupted_value:
+            interrupt_details = status.get("interruptDetails", {})
+            print(f"[VSAI-PY] Interrupt detected! interrupted={interrupted_value}, details={interrupt_details}", flush=True)
+            return {
+                "error": f"Movement interrupted by combat! Attacked by {interrupt_details.get('attackerCode', 'unknown')}",
+                "status": "interrupted",
+                "position": status.get("position", {}),
+                "statusMessage": f"Under attack by {interrupt_details.get('attackerCode', 'unknown')}",
+                "interruptDetails": interrupt_details
+            }
 
         current_status = status.get("status", "unknown")
         is_active = status.get("isActive", False)
@@ -104,6 +117,18 @@ def wait_for_movement_complete() -> dict[str, Any]:
             # Confirm by waiting one more poll
             time.sleep(MOVEMENT_POLL_INTERVAL_SEC)
             confirm = http_get("/bot/movement/status")
+
+            # Check confirm for interrupt too (in case damage happened between polls)
+            if confirm.get("interrupted"):
+                interrupt_details = confirm.get("interruptDetails", {})
+                return {
+                    "error": f"Movement interrupted by combat! Attacked by {interrupt_details.get('attackerCode', 'unknown')}",
+                    "status": "interrupted",
+                    "position": confirm.get("position", {}),
+                    "statusMessage": f"Under attack by {interrupt_details.get('attackerCode', 'unknown')}",
+                    "interruptDetails": interrupt_details
+                }
+
             if confirm.get("status") in terminal_states and not confirm.get("isActive", False):
                 return confirm
 
@@ -539,7 +564,26 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         final_status = wait_for_movement_complete()
 
         if "error" in final_status:
-            return final_status
+            # Include current position for interrupted/error states
+            pos = final_status.get("position", {})
+            end_pos = Position(pos.get("x", 0), pos.get("y", 0), pos.get("z", 0))
+
+            result = {
+                "success": False,
+                "status": final_status.get("status"),
+                "statusMessage": final_status.get("statusMessage"),
+                "error": final_status.get("error"),
+                "startPosition": {"x": start_pos.x, "y": start_pos.y, "z": start_pos.z},
+                "endPosition": {"x": end_pos.x, "y": end_pos.y, "z": end_pos.z},
+                "targetPosition": {"x": target.x, "y": target.y, "z": target.z},
+                "distanceToTarget": end_pos.distance_to(target)
+            }
+
+            # Include interrupt details if present
+            if "interruptDetails" in final_status:
+                result["interruptDetails"] = final_status["interruptDetails"]
+
+            return result
 
         end_pos = Position(
             final_status["position"]["x"],

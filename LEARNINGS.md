@@ -2425,4 +2425,184 @@ elif name == "bot_attack":
 Butchering a corpse requires right-clicking on an **entity** with a knife equipped. Would need a new `/bot/interact_entity` endpoint.
 
 ---
-*Last updated: Session 24 - Implemented bot_attack for melee combat. Fixed critical threading bug (Thread.Sleep on main thread). Successfully tested hunting deer with flint spear.*
+
+## JSON Patching: Making Hostile Mobs Aggro on the Bot
+
+By default, hostile mobs like drifters only target players. To make them attack the bot, you need to patch their AI task `entityCodes` arrays.
+
+### Patch File Location
+
+```
+mod/assets/vsai/patches/drifter-aggro.json
+```
+
+### Working Patch Format
+
+```json
+[
+  {
+    "op": "add",
+    "path": "/server/behaviors/8/aitasks/2/entityCodes/-",
+    "value": "aibot",
+    "file": "game:entities/lore/drifter",
+    "side": "server"
+  },
+  {
+    "op": "add",
+    "path": "/server/behaviors/8/aitasks/4/entityCodes/-",
+    "value": "aibot",
+    "file": "game:entities/lore/drifter",
+    "side": "server"
+  }
+]
+```
+
+### Key Learnings for JSON Patching
+
+1. **File path format:** `game:entities/lore/drifter` - NO `.json` extension!
+2. **Domain prefix:** Use `game:` even though files are in `assets/survival/`
+3. **Numeric indices required:** VS doesn't support wildcard selectors like `[code=taskai]`
+4. **Count behaviors carefully:** Starting from 0, count each behavior in the entity JSON
+5. **Append with `/-`:** Using `-` at end of path appends to array (won't overwrite)
+6. **`side: "server"`:** Optional optimization - only apply patch server-side
+7. **No comments:** VS patches don't support a `comment` field - will cause errors
+
+### Finding the Correct Indices
+
+For drifter.json (VS 1.21+), the structure is:
+- **Behavior 8** = `taskai` (contains all AI tasks)
+- **Task 2** = `meleeattack` (close combat)
+- **Task 4** = `seekentity` (approach target)
+
+Both tasks have `entityCodes: ["player"]` - we add `"aibot"` to target our bot.
+
+### How to Find Indices for Other Entities
+
+1. Find the entity JSON in VS assets: `/Applications/Vintage Story.app/assets/survival/entities/`
+2. Count server behaviors starting from 0 until you find `code: "taskai"`
+3. Within `aitasks`, count to find `meleeattack` and `seekentity` tasks
+
+### Debugging Patches
+
+Check VS logs for patch loading status:
+```
+JsonPatch Loader: 22 patches total, successfully applied 11 patches, missing files on 1 patches
+```
+
+- "missing files" = wrong file path (check domain prefix and .json extension)
+- No errors shown = patch syntax is valid
+
+### Entity Code Format
+
+Use short form without namespace: `"aibot"` not `"vsai:aibot"`
+
+The drifter JSON uses `"player"` (short form), so match that pattern.
+
+---
+
+## Combat Interrupt System
+
+Allows the bot to detect when it's being attacked during long-running operations (like `bot_goto`) and return early so the agent can respond defensively.
+
+### How It Works
+
+1. **EntityAiBot.ReceiveDamage()** - Overrides base method to capture damage events
+2. **CombatInterrupt struct** - Stores attacker info, damage, health
+3. **Movement status polling** - Returns `interrupted: true` when damage detected
+4. **Python handler** - Detects interrupt and returns early from `bot_goto`
+
+### Key Design Decisions
+
+1. **Don't auto-stop movement** - Let the agent decide how to respond
+2. **Interrupt persists until new movement** - Use `GetInterrupt()` (peek) not `ConsumeInterrupt()` (clear-on-read)
+3. **Clear on new command** - `bot_goto` clears any previous interrupt at start
+
+### C# Implementation
+
+**CombatInterrupt class:**
+```csharp
+public class CombatInterrupt
+{
+    public bool Interrupted { get; set; }
+    public long AttackerEntityId { get; set; }
+    public string AttackerCode { get; set; } = "";
+    public float DamageReceived { get; set; }
+    public float CurrentHealth { get; set; }
+    public float MaxHealth { get; set; }
+    public long Timestamp { get; set; }
+}
+```
+
+**EntityAiBot methods:**
+```csharp
+// Override to capture damage
+public override bool ReceiveDamage(DamageSource damageSource, float damage)
+
+// Peek at interrupt without clearing
+public CombatInterrupt? GetInterrupt()
+
+// Clear interrupt (called when starting new movement)
+public void ClearInterrupt()
+```
+
+**Movement status response includes:**
+```json
+{
+  "interrupted": true,
+  "interruptDetails": {
+    "attackerEntityId": 12345,
+    "attackerCode": "drifter-normal",
+    "damageReceived": 2.5,
+    "currentHealth": 17.5,
+    "maxHealth": 20
+  }
+}
+```
+
+### Python Implementation
+
+**wait_for_movement_complete()** checks for interrupt BEFORE terminal states:
+```python
+if status.get("interrupted"):
+    return {
+        "status": "interrupted",
+        "error": f"Movement interrupted by combat! Attacked by {attackerCode}",
+        "interruptDetails": interrupt_details
+    }
+```
+
+### Critical Bug Fix: Interrupt Timing
+
+**Problem:** Interrupt was consumed (cleared) on first poll, but movement might complete on same poll, returning "reached"/"stuck" instead of "interrupted".
+
+**Solution:**
+- Use `GetInterrupt()` which peeks without clearing
+- Interrupt persists across all polls until `ClearInterrupt()` called
+- `bot_goto` clears interrupt when starting new movement
+
+### bot_goto Response When Interrupted
+
+```json
+{
+  "success": false,
+  "status": "interrupted",
+  "error": "Movement interrupted by combat! Attacked by player",
+  "interruptDetails": {
+    "attackerEntityId": 909126,
+    "attackerCode": "player",
+    "damageReceived": 0.425,
+    "currentHealth": 19.575,
+    "maxHealth": 20
+  }
+}
+```
+
+### Future Enhancements
+
+1. **Auto-retaliation mode** - Bot automatically attacks back when interrupted
+2. **Health threshold alerts** - Interrupt if health drops below X%
+3. **Flee behavior** - Option to run away instead of fight
+4. **Interrupt bot_attack** - If attacked by different entity than current target
+
+---
+*Last updated: Session 25 - Implemented combat interrupt system for bot_goto. Fixed JSON patching for drifter aggro.*

@@ -2131,6 +2131,12 @@ public class VsaiModSystem : ModSystem
             return JsonError("No active bot");
         }
 
+        // Clear any previous combat interrupt when starting a new movement
+        if (_botEntity is EntityAiBot aiBot)
+        {
+            aiBot.ClearInterrupt();
+        }
+
         var body = ReadRequestBody(request);
         if (string.IsNullOrEmpty(body))
         {
@@ -2266,6 +2272,17 @@ public class VsaiModSystem : ModSystem
         var pos = _botEntity.ServerPos;
         var task = GetRemoteControlTask();
 
+        // Check for combat interrupt (peek, don't consume - interrupt persists until new movement)
+        CombatInterrupt? interrupt = null;
+        if (_botEntity is EntityAiBot aiBot)
+        {
+            interrupt = aiBot.GetInterrupt();
+            if (interrupt != null)
+            {
+                _serverApi?.Logger.Debug($"[VSAI] MovementStatus: Found interrupt from {interrupt.AttackerCode}, damage={interrupt.DamageReceived}");
+            }
+        }
+
         if (task == null)
         {
             return JsonSerializer.Serialize(new
@@ -2274,7 +2291,16 @@ public class VsaiModSystem : ModSystem
                 status = "no_task",
                 statusMessage = "RemoteControl AI task not found",
                 position = new { x = pos.X, y = pos.Y, z = pos.Z },
-                isActive = false
+                isActive = false,
+                interrupted = interrupt != null,
+                interruptDetails = interrupt != null ? new
+                {
+                    attackerEntityId = interrupt.AttackerEntityId,
+                    attackerCode = interrupt.AttackerCode,
+                    damageReceived = interrupt.DamageReceived,
+                    currentHealth = interrupt.CurrentHealth,
+                    maxHealth = interrupt.MaxHealth
+                } : null
             });
         }
 
@@ -2289,7 +2315,16 @@ public class VsaiModSystem : ModSystem
             target = lastTarget != null ? new { x = lastTarget.X, y = lastTarget.Y, z = lastTarget.Z } : null,
             isActive = task.IsActive(),
             isDirectWalking = task.IsDirectWalking(),
-            onGround = _botEntity.OnGround
+            onGround = _botEntity.OnGround,
+            interrupted = interrupt != null,
+            interruptDetails = interrupt != null ? new
+            {
+                attackerEntityId = interrupt.AttackerEntityId,
+                attackerCode = interrupt.AttackerCode,
+                damageReceived = interrupt.DamageReceived,
+                currentHealth = interrupt.CurrentHealth,
+                maxHealth = interrupt.MaxHealth
+            } : null
         });
     }
 

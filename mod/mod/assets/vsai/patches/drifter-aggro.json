@@ -1,0 +1,16 @@
+[
+  {
+    "op": "add",
+    "path": "/server/behaviors/8/aitasks/2/entityCodes/-",
+    "value": "aibot",
+    "file": "game:entities/lore/drifter",
+    "side": "server"
+  },
+  {
+    "op": "add",
+    "path": "/server/behaviors/8/aitasks/4/entityCodes/-",
+    "value": "aibot",
+    "file": "game:entities/lore/drifter",
+    "side": "server"
+  }
+]
