@@ -2605,4 +2605,158 @@ if status.get("interrupted"):
 4. **Interrupt bot_attack** - If attacked by different entity than current target
 
 ---
-*Last updated: Session 25 - Implemented combat interrupt system for bot_goto. Fixed JSON patching for drifter aggro.*
+
+## Harvesting Dead Animals (bot_harvest)
+
+Allows the bot to harvest dead animal corpses with a knife to obtain meat, hides, and other drops.
+
+### The Problem: SetHarvested(null) Skips Tool-Specific Drops
+
+The vanilla `EntityBehaviorHarvestable.SetHarvested(IPlayer byPlayer, float dropQuantityMultiplier)` method has this logic in `GenerateDrops()`:
+
+```csharp
+if (dstack.Tool != null && (byPlayer == null || dstack.Tool != byPlayer.InventoryManager.ActiveTool))
+    continue;
+```
+
+This means: if a drop requires a tool (like meat requiring a knife) AND the player is null, the drop is SKIPPED.
+
+**Since we're a bot entity (not a player), passing `null` for `byPlayer` causes ALL tool-specific drops to be skipped!**
+
+### The Solution: Manual Drop Generation via Reflection
+
+Instead of using `SetHarvested()`, we manually:
+
+1. Mark the entity as harvested via WatchedAttributes
+2. Access `jsonDrops` field via reflection
+3. Iterate through drops, filtering for knife-required items
+4. Generate items using `GetNextItemStack()` with proper multipliers
+5. Give items to bot inventory
+
+```csharp
+// Mark as harvested
+targetEntity.WatchedAttributes.SetBool("harvested", true);
+
+// Get jsonDrops via reflection
+var harvestableType = harvestable.GetType();
+var jsonDropsField = harvestableType.GetField("jsonDrops",
+    BindingFlags.NonPublic | BindingFlags.Instance);
+var jsonDrops = jsonDropsField.GetValue(harvestable) as BlockDropItemStack[];
+
+// Process each drop
+foreach (var dstack in jsonDrops)
+{
+    // Skip if requires non-knife tool
+    if (dstack.Tool != null && dstack.Tool != EnumTool.Knife)
+        continue;
+
+    // Calculate multiplier (weight only for nutritious items)
+    float extraMul = 1f;
+    if (dstack.ResolvedItemstack?.Collectible?.NutritionProps != null)
+        extraMul *= animalWeight;
+
+    var resolvedStack = dstack.GetNextItemStack(extraMul);
+    // Give to bot...
+}
+```
+
+### TryGiveItemStack Fails for Bot Entity
+
+`agent.TryGiveItemStack()` often fails silently for bot entities, even with empty inventory slots.
+
+**Solution: Manual slot insertion fallback**
+
+```csharp
+bool given = agent.TryGiveItemStack(stackToGive);
+int givenCount = quantity - stackToGive.StackSize;
+
+// Manual fallback if TryGiveItemStack fails
+if (givenCount == 0)
+{
+    var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+    var botInventory = inventoryBehavior?.Inventory;
+    if (botInventory != null)
+    {
+        for (int slotIdx = 0; slotIdx < botInventory.Count; slotIdx++)
+        {
+            var slot = botInventory[slotIdx];
+            if (slot?.Itemstack == null)
+            {
+                slot.Itemstack = stackToGive.Clone();
+                slot.MarkDirty();
+                givenCount = quantity;
+                break;
+            }
+        }
+    }
+}
+```
+
+### Drop Quantity Multipliers
+
+Vanilla applies multipliers differently based on item type:
+
+| Item Type | Multiplier |
+|-----------|------------|
+| Non-nutritious (hides, bones) | 1.0 |
+| Nutritious (meat) | 1.0 × animalWeight |
+
+**AnimalWeight** ranges from 0.5 to 1.0 based on the animal's growth/condition.
+
+### Animal Drop Expectations
+
+Different animals have vastly different base drops:
+
+| Animal | Meat (avg) | Hide | Notes |
+|--------|------------|------|-------|
+| Pudu deer | 1 | small | Smallest deer, intentionally low |
+| Fallow deer | 3-4 | medium | Medium deer |
+| Red deer | 5-6 | large | Large deer |
+| Wolf | 7 | medium | High meat yield |
+| Bear | 8-10 | large | Highest yield |
+
+**Pudu deer giving 1 meat is correct!** They were specifically nerfed in v1.20 to reflect their small size.
+
+### API Endpoint
+
+**POST /bot/harvest**
+```json
+{
+    "entityId": 12345
+}
+```
+
+**Response:**
+```json
+{
+    "success": true,
+    "entityId": 12345,
+    "entityCode": "deer-pudu-adult-female",
+    "harvestedItems": [
+        {"code": "game:redmeat-raw", "quantity": 1, "name": "Raw redmeat"},
+        {"code": "game:hide-raw-small", "quantity": 1, "name": "Raw hide (Small)"}
+    ],
+    "droppedItems": [],
+    "message": "Harvested deer-pudu-adult-female"
+}
+```
+
+### Requirements
+
+- Bot must have a **knife equipped** in right hand
+- Bot must be within **5 blocks** of the corpse
+- Entity must be **dead** (alive = false)
+- Entity must **not already be harvested**
+
+### Error Cases
+
+| Error | Cause |
+|-------|-------|
+| "No knife equipped" | Equip knife before harvesting |
+| "Entity is still alive" | Kill it first with bot_attack |
+| "Too far away (X blocks)" | Move closer with bot_goto |
+| "Already been harvested" | Corpse was already processed |
+| "Not harvestable" | Entity type has no harvestable behavior |
+
+---
+*Last updated: Session 26 - Implemented bot_harvest for harvesting dead animals. Fixed null player drop issue via reflection, added manual inventory insertion fallback.*

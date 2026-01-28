@@ -488,6 +488,18 @@ public class VsaiModSystem : ModSystem
                     }
                     break;
 
+                case "/bot/harvest":
+                    if (method != "POST")
+                    {
+                        statusCode = 405;
+                        responseBody = JsonError("Method not allowed. Use POST.");
+                    }
+                    else
+                    {
+                        responseBody = HandleBotHarvest(request);
+                    }
+                    break;
+
                 case "/bot/inbox":
                     responseBody = HandleBotInbox(request);
                     break;
@@ -1860,6 +1872,254 @@ public class VsaiModSystem : ModSystem
     {
         var healthBehavior = entity.GetBehavior<EntityBehaviorHealth>();
         return healthBehavior?.Health ?? 0;
+    }
+
+    private string HandleBotHarvest(HttpListenerRequest request)
+    {
+        if (_botEntity == null || !_botEntity.Alive)
+        {
+            return JsonError("No active bot");
+        }
+
+        if (_botEntity is not EntityAgent agent)
+        {
+            return JsonError("Bot is not an EntityAgent");
+        }
+
+        var body = ReadRequestBody(request);
+        if (string.IsNullOrEmpty(body))
+        {
+            return JsonError("Empty request body. Provide entityId.");
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("entityId", out var entityIdEl))
+            {
+                return JsonError("Missing entityId parameter");
+            }
+
+            long targetEntityId = entityIdEl.GetInt64();
+
+            // Variables for main thread
+            Entity? targetEntity = null;
+            string? errorMsg = null;
+            string entityCode = "unknown";
+            bool wasAlreadyHarvested = false;
+            var harvestedItems = new List<object>();
+            var droppedItems = new List<object>();
+
+            var waitHandle = new ManualResetEventSlim(false);
+
+            _serverApi?.Event.EnqueueMainThreadTask(() =>
+            {
+                try
+                {
+                    // Find entity
+                    var nearby = _serverApi?.World?.GetEntitiesAround(
+                        _botEntity.ServerPos.XYZ, 100f, 100f,
+                        e => e.EntityId == targetEntityId
+                    );
+
+                    if (nearby == null || !nearby.Any())
+                    {
+                        errorMsg = $"Entity {targetEntityId} not found within 100 blocks";
+                        return;
+                    }
+
+                    targetEntity = nearby.First();
+                    entityCode = targetEntity.Code?.Path ?? "unknown";
+
+                    // Must be dead
+                    if (targetEntity.Alive)
+                    {
+                        errorMsg = $"Entity {entityCode} is still alive. Kill it first.";
+                        return;
+                    }
+
+                    // Distance check
+                    double dist = _botEntity.ServerPos.XYZ.DistanceTo(targetEntity.ServerPos.XYZ);
+                    if (dist > 5.0)
+                    {
+                        errorMsg = $"Too far away ({dist:F1} blocks). Move closer.";
+                        return;
+                    }
+
+                    // Get harvestable behavior
+                    var harvestable = targetEntity.GetBehavior<EntityBehaviorHarvestable>();
+                    if (harvestable == null)
+                    {
+                        errorMsg = $"Entity {entityCode} is not harvestable";
+                        return;
+                    }
+
+                    // Already harvested?
+                    if (targetEntity.WatchedAttributes.GetBool("harvested", false))
+                    {
+                        wasAlreadyHarvested = true;
+                        errorMsg = $"Entity {entityCode} has already been harvested";
+                        return;
+                    }
+
+                    // Check knife equipped
+                    var toolStack = agent.RightHandItemSlot?.Itemstack;
+                    bool hasKnife = toolStack?.Collectible?.Tool == EnumTool.Knife;
+                    if (!hasKnife)
+                    {
+                        errorMsg = "No knife equipped. Equip a knife to harvest.";
+                        return;
+                    }
+
+                    // Mark as harvested
+                    targetEntity.WatchedAttributes.SetBool("harvested", true);
+
+                    // Get jsonDrops via reflection - SetHarvested(null) skips tool-specific drops
+                    // so we must manually generate drops when bot is harvesting
+                    var harvestableType = harvestable.GetType();
+                    var jsonDropsField = harvestableType.GetField("jsonDrops",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+                    if (jsonDropsField == null)
+                    {
+                        _serverApi?.Logger.Warning("[VSAI] Could not find jsonDrops field");
+                        errorMsg = "Could not access harvest drops (jsonDrops field not found)";
+                        return;
+                    }
+
+                    var jsonDrops = jsonDropsField.GetValue(harvestable) as BlockDropItemStack[];
+                    if (jsonDrops == null || jsonDrops.Length == 0)
+                    {
+                        _serverApi?.Logger.Warning("[VSAI] jsonDrops is null or empty");
+                        errorMsg = "No drops defined for this entity";
+                        return;
+                    }
+
+                    // Get animal weight for quantity calculation (like vanilla GenerateDrops)
+                    float animalWeight = targetEntity.WatchedAttributes.GetFloat("animalWeight", 1f);
+
+                    foreach (var dstack in jsonDrops)
+                    {
+                        if (dstack == null) continue;
+
+                        // Skip if drop requires a tool that isn't a knife
+                        if (dstack.Tool != null && dstack.Tool != EnumTool.Knife)
+                            continue;
+
+                        // Resolve the item stack - needs AssetLocation of source
+                        var sourceAsset = targetEntity.Code ?? new AssetLocation("game", "unknown");
+                        dstack.Resolve(_serverApi?.World, "harvest drop", sourceAsset);
+
+                        // Calculate multiplier like vanilla: weight only affects nutritious items
+                        float extraMul = 1f;
+                        if (dstack.ResolvedItemstack?.Collectible?.NutritionProps != null)
+                        {
+                            extraMul *= animalWeight;
+                        }
+
+                        var resolvedStack = dstack.GetNextItemStack(extraMul);
+                        if (resolvedStack == null)
+                            continue;
+
+                        string itemCode = resolvedStack.Collectible?.Code?.ToString() ?? "unknown";
+                        int quantity = resolvedStack.StackSize;
+
+                        // Give to bot
+                        var stackToGive = resolvedStack.Clone();
+                        agent.TryGiveItemStack(stackToGive);
+                        int givenCount = quantity - stackToGive.StackSize;
+
+                        // Manual slot insertion fallback if TryGiveItemStack fails
+                        if (givenCount == 0)
+                        {
+                            var inventoryBehavior = agent.GetBehavior<EntityBehaviorBotInventory>();
+                            var botInventory = inventoryBehavior?.Inventory;
+                            if (botInventory != null)
+                            {
+                                for (int slotIdx = 0; slotIdx < botInventory.Count; slotIdx++)
+                                {
+                                    var slot = botInventory[slotIdx];
+                                    if (slot?.Itemstack == null)
+                                    {
+                                        slot.Itemstack = stackToGive.Clone();
+                                        slot.MarkDirty();
+                                        givenCount = quantity;
+                                        stackToGive.StackSize = 0;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (givenCount > 0)
+                        {
+                            string itemName;
+                            try { itemName = resolvedStack.GetName() ?? itemCode; }
+                            catch { itemName = itemCode; }
+
+                            harvestedItems.Add(new
+                            {
+                                code = itemCode,
+                                quantity = givenCount,
+                                name = itemName
+                            });
+                        }
+
+                        if (stackToGive.StackSize > 0)
+                        {
+                            droppedItems.Add(new
+                            {
+                                code = itemCode,
+                                quantity = stackToGive.StackSize
+                            });
+                        }
+                    }
+
+                    _serverApi?.Logger.Notification($"[VSAI] Harvested {entityCode}: {harvestedItems.Count} items");
+                }
+                catch (Exception ex)
+                {
+                    errorMsg = ex.Message;
+                    _serverApi?.Logger.Error($"[VSAI] Harvest error: {ex}");
+                }
+                finally
+                {
+                    waitHandle.Set();
+                }
+            }, "VSAI-Harvest");
+
+            waitHandle.Wait(5000);
+
+            if (errorMsg != null)
+            {
+                return JsonSerializer.Serialize(new
+                {
+                    success = false,
+                    error = errorMsg,
+                    entityId = targetEntityId,
+                    entityCode,
+                    alreadyHarvested = wasAlreadyHarvested
+                });
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                entityId = targetEntityId,
+                entityCode,
+                harvestedItems,
+                droppedItems,
+                message = harvestedItems.Count > 0
+                    ? $"Harvested {entityCode}"
+                    : "No items obtained"
+            });
+        }
+        catch (JsonException ex)
+        {
+            return JsonError($"Invalid JSON: {ex.Message}");
+        }
     }
 
     private string HandleBotPlaceBlock(HttpListenerRequest request)

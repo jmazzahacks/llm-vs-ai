@@ -481,6 +481,20 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["entityId"]
             }
+        ),
+        Tool(
+            name="bot_harvest",
+            description="Harvest a dead animal corpse to get meat, hides, and other drops. Bot must have a knife equipped and be within 5 blocks of the corpse. Use bot_entities first to find dead animals (alive=false). Drop rate is 40% since bot is not a player.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entityId": {
+                        "type": "integer",
+                        "description": "Entity ID of the dead animal to harvest (from bot_entities)"
+                    }
+                },
+                "required": ["entityId"]
+            }
         )
     ]
 
@@ -772,6 +786,11 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "entityId": arguments["entityId"],
             "maxChaseDistance": arguments.get("maxChaseDistance", 30)
         }, timeout=65)
+
+    elif name == "bot_harvest":
+        return http_post("/bot/harvest", {
+            "entityId": arguments["entityId"]
+        })
 
     else:
         return {"error": f"Unknown tool: {name}"}
